@@ -46,12 +46,15 @@ def ssh_server(scratch, name, controller_key):
         f"Match User root\n    AuthorizedKeysFile {controller_key}\n",
         encoding="utf-8",
     )
-    process = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", str(configuration)], stderr=subprocess.PIPE)
+    # An undrained pipe can block sshd after repeated enrollment connections.
+    log_path = scratch / (name + ".stderr.log")
+    with log_path.open("wb") as log:
+        process = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", str(configuration)], stderr=log)
     try:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise RuntimeError(process.stderr.read().decode(errors="replace"))
+                raise RuntimeError(log_path.read_text(errors="replace"))
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                     break
@@ -62,7 +65,7 @@ def ssh_server(scratch, name, controller_key):
         yield port, public_key
     finally:
         process.terminate()
-        process.communicate(timeout=10)
+        process.wait(timeout=10)
 
 
 @contextmanager
