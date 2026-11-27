@@ -1,0 +1,19 @@
+[sources.isolate_audit]
+type = "file"
+include = [
+  "/opt/auth/spool/events.jsonl",
+]
+read_from = "beginning"
+
+[transforms.isolate_json]
+type = "remap"
+inputs = ["isolate_audit"]
+source = '''
+. = parse_json!(.message)
+'''
+
+# Replace this sink with your OpenSearch, ClickHouse, S3, or SIEM sink.
+[sinks.isolate_console]
+type = "console"
+inputs = ["isolate_json"]
+encoding.codec = "json"

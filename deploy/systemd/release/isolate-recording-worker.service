@@ -1,0 +1,25 @@
+[Unit]
+Description=Isolate recording outbox worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=auth
+Group=auth
+StateDirectory=isolate
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/isolate
+ExecStartPre=/usr/bin/python3.12 -I -B /opt/isolate/current/scripts/isolate-run.py --root /opt/isolate recordings --config /etc/isolate/isolate.yml --check
+ExecStart=/usr/bin/python3.12 -I -B /opt/isolate/current/scripts/isolate-run.py --root /opt/isolate recordings --config /etc/isolate/isolate.yml
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

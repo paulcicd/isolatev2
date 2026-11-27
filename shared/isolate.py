@@ -1,0 +1,2822 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Isolate v2 administrative CLI."""
+
+import argparse
+import datetime
+import getpass
+import functools
+import json
+import os
+import sys
+import time
+
+from isolate_announcements import AnnouncementError, create_announcement, delete_announcement, list_announcements
+
+from isolate_access import (
+    AccessDenied,
+    approve_access_request,
+    cancel_access_request,
+    comment_access_request,
+    create_access_request,
+    deny_access_request,
+    get_access_request,
+    is_access_admin,
+    owns_access_request,
+    list_access_requests,
+    parse_duration,
+    parse_access_time,
+    repeat_access_request,
+    renew_access_request,
+    revoke_access_request,
+    set_notification_status,
+)
+from isolate_audit import AuditSinkError, prepare_and_dispatch, verify_jsonl_file
+from isolate_backup import BackupError, create_backup, list_backups, restore_backup, verify_backup
+from isolate_command_audit import CommandAuditError, append_command_event
+from isolate_config import load_config
+from isolate_identity import (
+    IdentityError,
+    KeycloakDeviceClient,
+    clear_cached_identity,
+    decode_jwt_payload,
+    identity_cache_path,
+    load_verified_identity,
+    normalize_claims,
+    refresh_jwks_cache,
+    save_token_cache,
+)
+from isolate_history import HistoryAccessDenied, format_history_table, is_history_admin, list_user_profiles, read_history, user_activity_summary
+from isolate_inventory import HostValidationError, format_hosts_table, get_host, list_hosts, normalize_tags, update_host
+from isolate_service_discovery import get_discovery_history
+from isolate_jobs import (
+    JobError, _runbook_submission_plan, create_runbook_fleet, get_job, list_jobs,
+    read_job_output, request_job_cancel, retry_job,
+)
+from isolate_runbooks import RunbookError, get_runbook, list_runbooks
+from isolate_connectivity import ConnectivityError, check_host, get_last_check, save_check
+from isolate_exports import ExportError, flatten_access_matrix, render_export
+from isolate_notifications import NotificationError, notify_access_event
+from isolate_packages import (
+    AccessPackageError,
+    assign_package,
+    create_package,
+    get_package,
+    list_assignments,
+    list_package_revisions,
+    list_packages,
+    preview_package_update,
+    rollback_package,
+    unassign_package,
+    update_package,
+)
+from isolate_policy import PolicyDenied, resolve_grant, resolve_policy
+from isolate_permissions import authorize_inventory_change, filter_projects, has_permission, is_platform_admin
+from isolate_session_approvals import (
+    SessionApprovalDenied, decide_session_approval, get_session_approval,
+    list_session_approvals, revoke_session_approval,
+)
+from isolate_health import run_health_checks, validate_config
+from isolate_policy_bundle import (
+    PolicyBundleError,
+    apply_bundle,
+    change_count,
+    dump_bundle,
+    export_bundle,
+    load_bundle,
+    plan_bundle,
+    validate_bundle,
+    blast_radius,
+)
+from isolate_gitops import create_approval_attestation, GitOpsError, git_policy_status, list_policy_snapshots, rollback_policy, sync_git_policy
+from isolate_redis import create_redis_client
+from isolate_sessions import SessionControlError, get_session, list_active_sessions, request_session_termination
+from isolate_dashboard_data import build_access_matrix
+
+
+def redis_client(config):
+    return create_redis_client(config)
+
+
+def backup_redis_client(config):
+    backup_redis = (config.get("backup", {}) or {}).get("redis", {}) or {}
+    if not backup_redis:
+        return redis_client(config)
+    backup_config = dict(config)
+    redis_config = dict(config.get("redis", {}) or {})
+    redis_config.update(backup_redis)
+    backup_config["redis"] = redis_config
+    return create_redis_client(backup_config)
+
+
+def _write_private_file(path, content):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, mode=0o750, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as output_f:
+        output_f.write(content)
+    if os.name == "posix":
+        os.chmod(path, 0o640)
+
+
+def _effective_username():
+    if os.name == "posix":
+        import pwd
+
+        return pwd.getpwuid(os.geteuid()).pw_name
+    return getpass.getuser()
+
+
+def _manual_policy_mutation_blocked(config):
+    try:
+        _require_platform_admin(config)
+    except (AccessDenied, IdentityError) as exc:
+        print("Administration denied: {}".format(exc), file=sys.stderr)
+        return True
+    if config.get("policy_as_code", {}).get("enforce_git", False):
+        print("manual policy mutation is disabled; update the Git policy and run isolate policy sync", file=sys.stderr)
+        return True
+    return False
+
+
+def cmd_config_validate(args, config):
+    result = validate_config(config, check_paths=args.check_paths)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print("Configuration: {}".format("valid" if result["valid"] else "invalid"))
+        for warning in result["warnings"]:
+            print("warning: {}".format(warning))
+        for error in result["errors"]:
+            print("error: {}".format(error), file=sys.stderr)
+    return 0 if result["valid"] else 2
+
+
+def cmd_health(args, config):
+    result = run_health_checks(config)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print("Isolate health: {}".format(result["status"]))
+        for name, check in result["checks"].items():
+            print("{:<10} {}{}".format(name, "ok" if check.get("ok") else "failed", ": {}".format(check.get("error")) if check.get("error") else ""))
+    return 0 if result["ok"] else 2
+
+
+def cmd_audit_verify(args, config):
+    integrity = config.get("logging", {}).get("integrity") or {}
+    key_file = args.key_file or integrity.get("key_file")
+    if not key_file:
+        print("audit verification failed: integrity key file is not configured", file=sys.stderr)
+        return 2
+    try:
+        result = verify_jsonl_file(args.path, key_file)
+    except (OSError, ValueError, AuditSinkError) as exc:
+        print("audit verification failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["valid"] else 2
+
+
+def cmd_backup_create(args, config):
+    try:
+        result = create_backup(
+            config,
+            backup_redis_client(config),
+            output_path=args.output,
+            include_logs=args.include_logs,
+        )
+    except Exception as exc:
+        print("backup create failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_backup_list(args, config):
+    try:
+        rows = list_backups(config)
+    except (OSError, ValueError, BackupError) as exc:
+        print("backup list failed: {}".format(exc), file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    print("created_at                 size       files  redis  archive")
+    for row in rows:
+        print("{:<26} {:<10} {:<6} {:<6} {}".format(
+            str(row.get("created_at") or "error"),
+            str(row.get("size") or ""),
+            str(row.get("file_count") or ""),
+            str(row.get("redis_key_count") or ""),
+            row.get("archive"),
+        ))
+
+
+def cmd_backup_verify(args, config):
+    try:
+        result = verify_backup(args.archive)
+    except (OSError, ValueError, BackupError) as exc:
+        print("backup verify failed: {}".format(exc), file=sys.stderr)
+        return 2
+    display = dict(result)
+    display.pop("manifest", None)
+    print(json.dumps(display, indent=2, sort_keys=True))
+    return 0 if result["valid"] else 2
+
+
+def cmd_backup_restore(args, config):
+    if not args.yes:
+        print("backup restore requires --yes", file=sys.stderr)
+        return 2
+    try:
+        result = restore_backup(
+            args.archive,
+            args.target_root,
+            redis=backup_redis_client(config) if args.restore_redis else None,
+            restore_files=not args.skip_files,
+            restore_redis=args.restore_redis,
+            redis_conflict=args.redis_conflict,
+            preserve_owner=args.preserve_owner,
+            confirmed=True,
+            live=args.live,
+        )
+    except Exception as exc:
+        print("backup restore failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def _policy_bundle_from_args(args, config):
+    path = args.file or config.get("policy_as_code", {}).get("bundle_path")
+    if not path:
+        raise PolicyBundleError("policy bundle path is required")
+    return path, load_bundle(path)
+
+
+def cmd_policy_export(args, config):
+    bundle = export_bundle(redis_client(config))
+    rendered = dump_bundle(bundle, output_format=args.format)
+    if args.output == "-":
+        sys.stdout.write(rendered)
+    else:
+        _write_private_file(args.output, rendered)
+        print("Policy bundle exported: {}".format(args.output))
+
+
+def cmd_policy_validate(args, config):
+    try:
+        path, bundle = _policy_bundle_from_args(args, config)
+        result = validate_bundle(bundle)
+    except (OSError, ValueError, PolicyBundleError) as exc:
+        print("policy validation failed: {}".format(exc), file=sys.stderr)
+        return 2
+    result["path"] = path
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["valid"] else 2
+
+
+def cmd_policy_diff(args, config):
+    try:
+        path, bundle = _policy_bundle_from_args(args, config)
+        changes = plan_bundle(redis_client(config), bundle, prune=args.prune)
+    except (OSError, ValueError, PolicyBundleError) as exc:
+        print("policy diff failed: {}".format(exc), file=sys.stderr)
+        return 2
+    output = {"path": path, "prune": bool(args.prune), "change_count": change_count(changes), "changes": changes}
+    print(json.dumps(output, indent=2, sort_keys=True))
+
+
+def cmd_policy_apply(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    policy_cfg = config.get("policy_as_code", {})
+    if policy_cfg.get("require_confirmation", True) and not args.dry_run and not args.yes:
+        print("policy apply requires --yes; use --dry-run to preview changes", file=sys.stderr)
+        return 2
+    try:
+        path, bundle = _policy_bundle_from_args(args, config)
+        redis = redis_client(config)
+        changes = plan_bundle(redis, bundle, prune=args.prune)
+        if not args.dry_run and change_count(changes):
+            backup_dir = policy_cfg.get("backup_dir") or os.path.join(config.get("data_root", "/opt/auth"), "backups")
+            stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+            backup_path = os.path.join(backup_dir, "policy-{}.yml".format(stamp))
+            _write_private_file(backup_path, dump_bundle(export_bundle(redis), output_format="yaml"))
+        else:
+            backup_path = None
+        changes = apply_bundle(redis, bundle, prune=args.prune, dry_run=args.dry_run)
+    except (OSError, ValueError, PolicyBundleError) as exc:
+        print("policy apply failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({
+        "applied": not args.dry_run,
+        "backup_path": backup_path,
+        "change_count": change_count(changes),
+        "changes": changes,
+        "source": path,
+    }, indent=2, sort_keys=True))
+
+
+def cmd_policy_blast_radius(args, config):
+    try:
+        path, bundle = _policy_bundle_from_args(args, config)
+        redis = redis_client(config)
+        result = blast_radius(redis, bundle, list_hosts(redis), prune=args.prune)
+        result["path"] = path
+    except (OSError, ValueError, PolicyBundleError) as exc:
+        print("policy blast-radius failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_policy_drift(args, config):
+    try:
+        if args.git:
+            result = git_policy_status(config, redis_client(config))
+        else:
+            path, bundle = _policy_bundle_from_args(args, config)
+            redis = redis_client(config)
+            changes = plan_bundle(redis, bundle, prune=args.prune)
+            result = {
+                "source": path,
+                "drift": change_count(changes) > 0,
+                "change_count": change_count(changes),
+                "changes": changes,
+                "blast_radius": blast_radius(redis, bundle, list_hosts(redis), prune=args.prune),
+            }
+    except (OSError, ValueError, PolicyBundleError, GitOpsError) as exc:
+        print("policy drift failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 3 if result.get("drift") else 0
+
+
+def cmd_policy_sync(args, config):
+    try:
+        result = sync_git_policy(
+            config,
+            redis_client(config),
+            dry_run=bool(args.dry_run or not args.yes),
+            confirmed=bool(args.yes),
+        )
+    except (OSError, ValueError, PolicyBundleError, GitOpsError) as exc:
+        print("policy sync failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_policy_revisions(args, config):
+    print(json.dumps(list_policy_snapshots(config), indent=2, sort_keys=True))
+
+
+def cmd_policy_rollback(args, config):
+    try:
+        result = rollback_policy(config, redis_client(config), args.revision, confirmed=args.yes)
+    except (OSError, ValueError, PolicyBundleError, GitOpsError) as exc:
+        print("policy rollback failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_policy_attest(args, config):
+    try:
+        path = args.file or config.get("policy_as_code", {}).get("bundle_path")
+        if not path:
+            raise GitOpsError("policy bundle path is required")
+        record = create_approval_attestation(
+            config,
+            path,
+            args.branch or config.get("policy_as_code", {}).get("branch") or "main",
+            args.approver,
+            pr_url=args.pr_url,
+        )
+        rendered = json.dumps(record, indent=2, sort_keys=True) + "\n"
+        if args.output == "-":
+            sys.stdout.write(rendered)
+        else:
+            _write_private_file(args.output, rendered)
+            print("Policy approval attestation created: {}".format(args.output))
+    except (OSError, ValueError, PolicyBundleError, GitOpsError) as exc:
+        print("policy attestation failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def decode(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def load_rules(redis):
+    rules = []
+    for key in redis.keys("policy_*"):
+        rules.append(json.loads(decode(redis.get(key))))
+    return rules
+
+
+def load_grants(redis):
+    grants = []
+    for pattern in ("grant_*", "policy_*"):
+        for key in redis.keys(pattern):
+            key_name = _redis_key_name(key)
+            grant = json.loads(decode(redis.get(key)))
+            if key_name.startswith("grant_"):
+                grant["id"] = key_name.replace("grant_", "", 1)
+            elif key_name.startswith("policy_"):
+                grant["id"] = key_name
+            grants.append(grant)
+    return grants
+
+
+def load_project_sets(redis):
+    project_sets = {}
+    for key in redis.keys("project_set_*"):
+        data = json.loads(decode(redis.get(key)))
+        project_sets[data["name"]] = data
+    return project_sets
+
+
+def _redis_key_name(key):
+    return decode(key)
+
+
+def list_grant_records(redis, **filters):
+    grants = []
+    for key in redis.keys("grant_*"):
+        key_name = _redis_key_name(key)
+        grant = json.loads(decode(redis.get(key)))
+        grant["id"] = key_name.replace("grant_", "", 1)
+        if filters.get("user") and not (grant.get("subject") == "user" and grant.get("name") == filters["user"]):
+            continue
+        if filters.get("group") and not (grant.get("subject") == "group" and grant.get("name") == filters["group"]):
+            continue
+        if filters.get("project") and grant.get("project") != filters["project"]:
+            continue
+        if filters.get("project_set") and grant.get("project_set") != filters["project_set"]:
+            continue
+        if filters.get("project_glob") and grant.get("project_glob") != filters["project_glob"]:
+            continue
+        grants.append(grant)
+    return sorted(grants, key=lambda grant: int(grant["id"]) if str(grant["id"]).isdigit() else grant["id"])
+
+
+def get_grant_record(redis, grant_id):
+    raw = redis.get("grant_{}".format(grant_id))
+    if raw is None:
+        return None
+    grant = json.loads(decode(raw))
+    grant["id"] = str(grant_id)
+    return grant
+
+
+def update_grant_record(redis, grant_id, updates):
+    grant = get_grant_record(redis, grant_id)
+    if grant is None:
+        return None
+    grant.pop("id", None)
+    grant.update({key: value for key, value in updates.items() if value is not None})
+    redis.set("grant_{}".format(grant_id), json.dumps(grant, sort_keys=True))
+    grant["id"] = str(grant_id)
+    return grant
+
+
+def format_grants_table(grants):
+    columns = [
+        ("id", "id", 4),
+        ("subject", "subject", 7),
+        ("name", "name", 18),
+        ("selector", "selector", 24),
+        ("host", "host", 8),
+        ("remote_user", "remote_user", 12),
+        ("sudo_mode", "sudo_mode", 10),
+    ]
+    lines = ["  ".join(label.ljust(width) for _, label, width in columns)]
+    for grant in grants:
+        selector = grant.get("project") or grant.get("project_set") or grant.get("project_glob") or ""
+        row = dict(grant)
+        row["selector"] = selector
+        lines.append("  ".join(str(row.get(key) or "").ljust(width) for key, _, width in columns))
+    return "\n".join(lines)
+
+
+def format_access_table(records):
+    columns = [
+        ("id", "id", 4),
+        ("status", "status", 9),
+        ("requester", "user", 16),
+        ("project", "project", 14),
+        ("host", "host", 8),
+        ("remote_user", "remote_user", 12),
+        ("sudo_mode", "sudo", 8),
+        ("reason", "reason", 24),
+    ]
+    lines = ["  ".join(label.ljust(width) for _, label, width in columns)]
+    for record in records:
+        lines.append("  ".join(str(record.get(key) or "").ljust(width) for key, _, width in columns))
+    return "\n".join(lines)
+
+
+def _print_notification_warnings(result):
+    for error in result.get("errors") or []:
+        print("notification warning: {}".format(error), file=sys.stderr)
+
+
+def _record_notification_status(redis, request_id, result=None, error=None):
+    if error:
+        set_notification_status(redis, request_id, {"ok": False, "errors": [str(error)], "sent": []})
+    elif result is not None:
+        set_notification_status(redis, request_id, {"ok": not bool(result.get("errors")), "errors": result.get("errors") or [], "sent": result.get("sent") or []})
+
+
+def _load_cli_identity():
+    return load_verified_identity(load_config())
+
+
+def _require_access_admin(config):
+    identity = _load_cli_identity()
+    if not is_access_admin(identity, config.get("access", {}).get("admin_groups") or []):
+        raise AccessDenied("access administration is allowed only for configured admin groups")
+    return identity
+
+
+def _require_platform_admin(config):
+    if os.name == "posix" and os.geteuid() == 0:
+        return {"username": "root"}
+    # A user-supplied ISOLATE_CONFIG must not define their own trusted issuer or
+    # administrator groups. Read authorization settings from the system config.
+    from isolate_connection_auth import trusted_config, bind_identity, ConnectionDenied
+    try:
+        authorization_config = trusted_config()
+        if os.name == "posix":
+            import pwd
+            username = pwd.getpwuid(os.getuid()).pw_name
+        else:
+            raise ConnectionDenied("platform administration requires a Linux host")
+        from isolate_identity import _load_token_cache
+        from isolate_oidc import identity_provider_config
+        token_kind = identity_provider_config(authorization_config).get('token_kind', 'id_token')
+        identity = bind_identity(_load_token_cache().get(token_kind), authorization_config, username,
+                                 redis=redis_client(authorization_config))
+    except (ConnectionDenied, OSError) as exc:
+        raise AccessDenied(str(exc)) from exc
+    groups = authorization_config.get("dashboard", {}).get("admin_groups") or authorization_config.get("access", {}).get("admin_groups") or []
+    if not is_access_admin(identity, groups):
+        raise AccessDenied("an administrator identity is required")
+    return identity
+
+
+def authorize_cli_command(args, config):
+    """Restrict the CLI as well as the dashboard; Redis credentials are privileged."""
+    public_functions = {cmd_login, cmd_logout, cmd_whoami, cmd_history, cmd_access_request, cmd_connect,
+                        cmd_access_list, cmd_access_show, cmd_access_comment, cmd_access_repeat,
+                        cmd_access_cancel, cmd_access_renew, cmd_job_list, cmd_job_show,
+                        cmd_job_output, cmd_job_cancel, cmd_job_retry, cmd_runbook,
+                        cmd_host_list, cmd_host_show, cmd_host_update, cmd_host_maintenance,
+                        cmd_host_check, cmd_host_services_history, cmd_export,
+                        cmd_session_search,
+                        cmd_access_approve, cmd_access_deny, cmd_access_revoke,
+                        cmd_session_approval,
+                        cmd_user_activity, cmd_command_log_append}
+    if args.func not in public_functions:
+        _require_platform_admin(config)
+
+
+def _management_context(config):
+    """Use trusted configuration and a Unix-bound identity for delegated work."""
+    if os.name == "posix" and os.geteuid() == 0:
+        return config, {"username": "root", "groups": ["isolate:local-root"], "_local_root": True}
+    return _job_context()
+
+
+def _management_admin(identity, config):
+    return bool(identity.get("_local_root")) or is_platform_admin(identity, config)
+
+
+def _management_allowed(identity, config, permission, project=None):
+    if _management_admin(identity, config):
+        return True
+    if permission.startswith("access.") and is_access_admin(identity, config.get("access", {}).get("admin_groups") or []):
+        return True
+    return has_permission(identity, config, permission, project)
+
+
+def _require_management_permission(identity, config, permission, project=None):
+    if not _management_allowed(identity, config, permission, project):
+        raise AccessDenied("{} is not allowed for project '{}'".format(permission, project or "<none>"))
+
+
+def _management_rows(rows, identity, config, permission, project_field="project"):
+    if _management_admin(identity, config):
+        return list(rows)
+    if permission.startswith("access.") and is_access_admin(identity, config.get("access", {}).get("admin_groups") or []):
+        return list(rows)
+    return filter_projects(rows, identity, config, permission, project_field)
+
+
+def _management_host(redis, server_id, identity, config, permission):
+    host = get_host(redis, server_id)
+    if host is None or not host.get("project_name"):
+        raise AccessDenied("host was not found or is not visible")
+    _require_management_permission(identity, config, permission, host["project_name"])
+    return host
+
+
+def _managed_cli(permission=None):
+    def decorate(handler):
+        @functools.wraps(handler)
+        def wrapped(args, config):
+            try:
+                config, identity = _management_context(config)
+                if permission:
+                    _require_management_permission(identity, config, permission)
+                args._management_identity = identity
+                return handler(args, config)
+            except (AccessDenied, IdentityError, HostValidationError, ValueError) as exc:
+                print("{} denied: {}".format(handler.__name__.removeprefix("cmd_").replace("_", " "), exc), file=sys.stderr)
+                return 2
+        return wrapped
+    return decorate
+
+
+def _authorize_host_update(identity, config):
+    def authorize(current, proposed):
+        if not identity.get("_local_root"):
+            authorize_inventory_change(identity, config, current, proposed)
+    return authorize
+
+
+def _load_package_file(path):
+    if not path:
+        raise AccessPackageError("package file is required")
+    with open(path, "r", encoding="utf-8") as package_f:
+        text = package_f.read()
+    try:
+        if path.endswith(".json"):
+            payload = json.loads(text)
+        else:
+            import yaml
+
+            payload = yaml.safe_load(text)
+    except (ImportError, ValueError) as exc:
+        raise AccessPackageError("cannot parse package file: {}".format(exc)) from exc
+    if not isinstance(payload, dict):
+        raise AccessPackageError("package file must contain an object")
+    return payload
+
+
+def _package_admin(config):
+    if not config.get("access_packages", {}).get("enabled", True):
+        raise AccessPackageError("access packages are disabled")
+    return _require_access_admin(config)
+
+
+def _check_package_approval_admin(package, identity):
+    groups = set(identity.get("groups") or [])
+    allowed = set((package.get("approval") or {}).get("admin_groups") or [])
+    if allowed and not groups.intersection(allowed):
+        raise AccessPackageError("package assignment requires one of its approval admin groups")
+
+
+def cmd_package_list(args, config):
+    rows = list_packages(redis_client(config), status=args.status)
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    print("id    status    rev  rules  name")
+    for row in rows:
+        print("{:<5} {:<9} {:<4} {:<6} {}".format(
+            row.get("id"), row.get("status"), row.get("revision"), len(row.get("access") or []), row.get("name")
+        ))
+
+
+def cmd_package_show(args, config):
+    try:
+        package = get_package(redis_client(config), args.package)
+    except AccessPackageError as exc:
+        print("package show failed: {}".format(exc), file=sys.stderr)
+        return 2
+    if package is None:
+        print("Access package not found: {}".format(args.package), file=sys.stderr)
+        return 2
+    print(json.dumps(package, indent=2, sort_keys=True))
+
+
+def cmd_package_create(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    try:
+        identity = _package_admin(config)
+        record = create_package(
+            redis_client(config),
+            _load_package_file(args.file),
+            actor=identity.get("username"),
+            max_rules=config.get("access_packages", {}).get("max_rules", 50),
+        )
+    except (AccessDenied, IdentityError, OSError, AccessPackageError) as exc:
+        print("package create failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_package_preview(args, config):
+    try:
+        identity = _package_admin(config)
+        result = preview_package_update(
+            redis_client(config),
+            args.package,
+            _load_package_file(args.file),
+            actor=identity.get("username"),
+            max_rules=config.get("access_packages", {}).get("max_rules", 50),
+        )
+    except (AccessDenied, IdentityError, OSError, AccessPackageError) as exc:
+        print("package preview failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_package_update(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    if not args.yes:
+        print("package update requires --yes; run package preview first", file=sys.stderr)
+        return 2
+    try:
+        identity = _package_admin(config)
+        package, assignments = update_package(
+            redis_client(config),
+            args.package,
+            _load_package_file(args.file),
+            actor=identity.get("username"),
+            expected_revision=args.expected_revision,
+            max_rules=config.get("access_packages", {}).get("max_rules", 50),
+        )
+    except (AccessDenied, IdentityError, OSError, AccessPackageError) as exc:
+        print("package update failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({"package": package, "assignment_sync": assignments}, indent=2, sort_keys=True))
+
+
+def _package_subjects(args):
+    subjects = []
+    for subject in ("user", "group", "role"):
+        subjects.extend((subject, name) for name in (getattr(args, subject, None) or []))
+    if not subjects:
+        raise AccessPackageError("at least one --user, --group, or --role is required")
+    return subjects
+
+
+def cmd_package_assign(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    if not args.yes:
+        print("package assign requires --yes", file=sys.stderr)
+        return 2
+    redis = redis_client(config)
+    try:
+        identity = _package_admin(config)
+        package = get_package(redis, args.package)
+        if package is None:
+            raise AccessPackageError("access package was not found")
+        _check_package_approval_admin(package, identity)
+        subjects = _package_subjects(args)
+        max_subjects = int(config.get("access_packages", {}).get("max_assignments_per_operation") or 100)
+        if len(subjects) > max_subjects:
+            raise AccessPackageError("assignment operation exceeds configured subject limit")
+        results = []
+        for subject, name in subjects:
+            assignment, changes = assign_package(
+                redis,
+                package["id"],
+                subject,
+                name,
+                actor=identity.get("username"),
+                ttl=args.ttl,
+                permanent=args.permanent,
+                ticket=args.ticket,
+            )
+            results.append({"assignment": assignment, "grant_changes": changes})
+    except (AccessDenied, IdentityError, ValueError, AccessPackageError) as exc:
+        print("package assign failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(results, indent=2, sort_keys=True))
+
+
+def cmd_package_assignments(args, config):
+    try:
+        rows = list_assignments(
+            redis_client(config),
+            package=args.package,
+            subject=args.subject,
+            name=args.name,
+            include_expired=args.all,
+        )
+    except AccessPackageError as exc:
+        print("package assignments failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(rows, indent=2, sort_keys=True))
+
+
+def cmd_package_unassign(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    if not args.yes:
+        print("package unassign requires --yes", file=sys.stderr)
+        return 2
+    try:
+        identity = _package_admin(config)
+        assignment, deleted = unassign_package(redis_client(config), args.id, actor=identity.get("username"))
+    except (AccessDenied, IdentityError, AccessPackageError) as exc:
+        print("package unassign failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({"assignment": assignment, "grants_deleted": deleted}, indent=2, sort_keys=True))
+
+
+def cmd_package_revisions(args, config):
+    try:
+        rows = list_package_revisions(redis_client(config), args.package)
+    except AccessPackageError as exc:
+        print("package revisions failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(rows, indent=2, sort_keys=True))
+
+
+def cmd_package_rollback(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    if not args.yes:
+        print("package rollback requires --yes", file=sys.stderr)
+        return 2
+    try:
+        identity = _package_admin(config)
+        package, assignments = rollback_package(
+            redis_client(config),
+            args.package,
+            args.revision,
+            actor=identity.get("username"),
+            expected_revision=args.expected_revision,
+        )
+    except (AccessDenied, IdentityError, AccessPackageError) as exc:
+        print("package rollback failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({"package": package, "assignment_sync": assignments}, indent=2, sort_keys=True))
+
+
+def cmd_policy_add(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    redis = redis_client(config)
+    rule = {
+        "schema_version": 2,
+        "subject": args.subject,
+        "name": args.name,
+        "project": args.project,
+        "host": args.host,
+        "remote_user": args.remote_user,
+        "sudo_mode": args.sudo_mode,
+        "allowed_actions": args.allowed_action,
+    }
+    rule_id = redis.incr("offset_policy_id")
+    redis.set("policy_{}".format(rule_id), json.dumps(rule, sort_keys=True))
+    print("Policy added: {}".format(rule_id))
+
+
+def cmd_policy_test(args, config):
+    redis = redis_client(config)
+    identity = normalize_claims(
+        {
+            "sub": "test:{}".format(args.user),
+            "preferred_username": args.user,
+            "groups": args.group or [],
+        }
+    )
+    host = None
+    if args.host:
+        raw = redis.get("server_{}".format(args.host))
+        if raw is not None:
+            host = json.loads(decode(raw))
+        else:
+            host = {"server_id": args.host, "server_name": args.host}
+    defaults = {}
+    defaults.update(config.get("policy", {}))
+    defaults.update(config.get("ssh", {}))
+    try:
+        decision = resolve_policy(
+            identity,
+            project=args.project,
+            host=host,
+            rules=load_rules(redis),
+            defaults=defaults,
+        )
+        print(json.dumps(decision, indent=2, sort_keys=True))
+    except PolicyDenied as exc:
+        print(json.dumps({"denied": str(exc)}, indent=2, sort_keys=True))
+        return 2
+    return 0
+
+
+@_managed_cli("audit.read")
+def cmd_session_search(args, config):
+    base = config["logging"]["base_path"]
+    for root, _, files in os.walk(base):
+        if "session.jsonl" not in files:
+            continue
+        path = os.path.join(root, "session.jsonl")
+        with open(path, "r", encoding="utf-8") as session_f:
+            for line in session_f:
+                record = json.loads(line)
+                if not _management_admin(args._management_identity, config) and (not record.get("project") or not
+                    has_permission(args._management_identity, config, "audit.read", record["project"])):
+                    continue
+                if args.user and record.get("username") != args.user:
+                    continue
+                if args.project and record.get("project") != args.project:
+                    continue
+                print(json.dumps(record, sort_keys=True))
+
+
+def cmd_session_terminate(args, config):
+    if not config.get("session_control", {}).get("terminate_enabled", False):
+        print("session termination is disabled", file=sys.stderr)
+        return 2
+    try:
+        identity = load_verified_identity(config)
+    except IdentityError as exc:
+        print("Isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+    admin_groups = config.get("dashboard", {}).get("admin_groups") or config.get("access", {}).get("admin_groups") or []
+    if not is_access_admin(identity, admin_groups):
+        print("session termination requires an administrator group", file=sys.stderr)
+        return 2
+    if not args.yes:
+        print("session terminate requires --yes", file=sys.stderr)
+        return 2
+    try:
+        record = request_session_termination(redis_client(config), args.connection_id, identity, reason=args.reason)
+    except SessionControlError as exc:
+        print("session terminate failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_session_approval(args, config):
+    """Inspect or decide connection-specific requests as a verified human."""
+    try:
+        config, identity = _job_context()
+        if not identity.get("keycloak_sub"):
+            raise SessionApprovalDenied("a stable verified subject is required")
+        redis = redis_client(config)
+        action = args.approval_command
+
+        def visible(record):
+            project = record.get("project")
+            return (record.get("requester_sub") == identity["keycloak_sub"]
+                    or bool(project and (has_permission(identity, config, "sessions.read", project)
+                                         or has_permission(identity, config, "sessions.approve", project))))
+
+        if action == "list":
+            rows = [row for row in list_session_approvals(redis, status=args.status, project=args.project) if visible(row)]
+            if args.json:
+                print(json.dumps(rows, indent=2, sort_keys=True))
+            else:
+                print("id                                status    project            host    user             approvals")
+                for row in rows:
+                    print("{:<33} {:<9} {:<18} {:<7} {:<16} {}/{}".format(row["id"], row["status"], row.get("project") or "",
+                        row.get("host_id") or "", row.get("requester") or "", len(row.get("approvals") or []), row.get("required_approvals") or 1))
+            return 0
+        record = get_session_approval(redis, args.id)
+        if record is None or not visible(record):
+            raise SessionApprovalDenied("session approval was not found or is not visible")
+        if action == "show":
+            print(json.dumps(record, indent=2, sort_keys=True))
+            return 0
+        if not args.yes:
+            raise SessionApprovalDenied("explicit --yes is required for a session decision")
+        project = record.get("project")
+        if not project or not has_permission(identity, config, "sessions.approve", project):
+            raise SessionApprovalDenied("session decision is outside the authorized project scope")
+        if action == "revoke":
+            record = revoke_session_approval(redis, config, args.id, identity, reason=args.reason)
+        else:
+            record = decide_session_approval(redis, config, args.id, identity, approve=action == "approve", reason=args.reason)
+        if record is None:
+            raise SessionApprovalDenied("session approval was not found")
+        prepare_and_dispatch({"event": "session_approval_" + action, "source": "isolate-cli", "ts": time.time(),
+            "username": identity.get("username"), "keycloak_sub": identity["keycloak_sub"],
+            "session_approval_id": args.id, "project": project, "host_id": record.get("host_id"),
+            "outcome": record.get("status")}, config.get("logging", {}))
+        print(json.dumps(record, indent=2, sort_keys=True))
+    except (AccessDenied, IdentityError, SessionApprovalDenied, AuditSinkError, ValueError) as exc:
+        print("session approval failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_whoami(args, config):
+    try:
+        identity = load_verified_identity(config)
+    except IdentityError as exc:
+        print("isolate identity unavailable: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(identity, indent=2, sort_keys=True))
+
+
+def cmd_logout(args, config):
+    removed = clear_cached_identity()
+    if removed:
+        print("Isolate identity removed: {}".format(identity_cache_path()))
+    else:
+        print("No Isolate identity found: {}".format(identity_cache_path()))
+
+
+def cmd_login(args, config):
+    try:
+        from isolate_oidc import identity_provider_config
+        provider = identity_provider_config(config)
+        client = KeycloakDeviceClient(provider)
+        options = {}
+        if getattr(args, "step_up", False):
+            step = config.get("identity_security", {}).get("step_up", {})
+            options = {"acr_values": step.get("acr_values") or [], "max_age": int(step.get("max_age_seconds", 300))}
+        device = client.start(**options)
+        url = device.get("verification_uri_complete") or device.get("verification_uri")
+        print("Open this URL to authorize Isolate:")
+        print(url)
+        if device.get("user_code"):
+            print("Code: {}".format(device["user_code"]))
+        tokens = client.poll(device["device_code"], interval=int(device.get("interval", 5)))
+        from isolate_identity import verify_jwt_claims
+        kind = provider.get("token_kind", "id_token")
+        if not tokens.get(kind):
+            raise IdentityError("Identity provider did not issue the configured token kind")
+        claims = verify_jwt_claims(tokens[kind], provider)
+        identity = normalize_claims(claims, provider)
+        if config.get("api", {}).get("client_url"):
+            from isolate_client import verify_client_identity
+            identity = verify_client_identity(config, tokens[kind], identity)
+        elif provider["provider"] == "oidc":
+            from isolate_identity_binding import ensure_provider_binding
+            ensure_provider_binding(config, redis_client(config))
+        save_token_cache(tokens, identity)
+        print(json.dumps({key: identity.get(key) for key in ("username", "keycloak_sub", "groups", "exp")}, indent=2, sort_keys=True))
+    except IdentityError as exc:
+        print("isolate login failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def _subject_from_args(args):
+    if getattr(args, "service", None):
+        return "service", args.service
+    if getattr(args, "user", None):
+        return "user", args.user
+    if getattr(args, "group", None):
+        return "group", args.group
+    raise ValueError("grant subject is required")
+
+
+def cmd_project_set_add(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    redis = redis_client(config)
+    key = "project_set_{}".format(args.name)
+    existing = redis.get(key)
+    if existing is not None:
+        project_set = json.loads(decode(existing))
+    else:
+        project_set = {
+            "schema_version": 2,
+            "name": args.name,
+            "projects": [],
+            "project_globs": [],
+        }
+    project_set["projects"] = sorted(set((project_set.get("projects") or []) + (getattr(args, "project", None) or [])))
+    project_set["project_globs"] = sorted(
+        set((project_set.get("project_globs") or []) + (getattr(args, "project_glob", None) or []))
+    )
+    redis.set(key, json.dumps(project_set, sort_keys=True))
+    print("Project set saved: {}".format(args.name))
+
+
+def cmd_project_set_remove_project(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    redis = redis_client(config)
+    key = "project_set_{}".format(args.name)
+    existing = redis.get(key)
+    if existing is None:
+        print("Project set not found: {}".format(args.name), file=sys.stderr)
+        return 2
+    project_set = json.loads(decode(existing))
+    project_set["projects"] = [p for p in project_set.get("projects") or [] if p != args.project]
+    redis.set(key, json.dumps(project_set, sort_keys=True))
+    print("Project removed from set: {} {}".format(args.name, args.project))
+
+
+def cmd_project_set_list(args, config):
+    redis = redis_client(config)
+    rows = sorted(load_project_sets(redis).values(), key=lambda item: item["name"])
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    print("name                 projects  globs")
+    for row in rows:
+        print("{:<20} {:<8} {}".format(row["name"], len(row.get("projects") or []), len(row.get("project_globs") or [])))
+
+
+def cmd_project_set_show(args, config):
+    redis = redis_client(config)
+    project_set = load_project_sets(redis).get(args.name)
+    if project_set is None:
+        print("Project set not found: {}".format(args.name), file=sys.stderr)
+        return 2
+    print(json.dumps(project_set, indent=2, sort_keys=True))
+
+
+def cmd_project_set_remove_pattern(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    redis = redis_client(config)
+    key = "project_set_{}".format(args.name)
+    existing = redis.get(key)
+    if existing is None:
+        print("Project set not found: {}".format(args.name), file=sys.stderr)
+        return 2
+    project_set = json.loads(decode(existing))
+    project_set["project_globs"] = [p for p in project_set.get("project_globs") or [] if p != args.project_glob]
+    redis.set(key, json.dumps(project_set, sort_keys=True))
+    print("Pattern removed from set: {} {}".format(args.name, args.project_glob))
+
+
+def cmd_project_set_remove(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    redis = redis_client(config)
+    deleted = redis.delete("project_set_{}".format(args.name))
+    print("Project sets removed: {}".format(deleted))
+    return 0 if deleted else 2
+
+
+def cmd_grant_add(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    redis = redis_client(config)
+    try:
+        subject, name = _subject_from_args(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    grant = {
+        "schema_version": 2,
+        "subject": subject,
+        "name": name,
+        "project": args.project,
+        "project_glob": args.project_glob,
+        "project_set": args.project_set,
+        "host": args.host,
+        "remote_user": args.remote_user,
+        "sudo_mode": args.sudo_mode,
+        "allowed_actions": args.allowed_action,
+    }
+    grant_id = redis.incr("offset_grant_id")
+    redis.set("grant_{}".format(grant_id), json.dumps(grant, sort_keys=True))
+    print("Grant added: {}".format(grant_id))
+
+
+def cmd_grant_revoke(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    redis = redis_client(config)
+    if args.id:
+        grant = get_grant_record(redis, args.id)
+        if grant and grant.get("managed_by") == "access_package":
+            print("Grant {} is managed by access package {}; unassign or update the package instead".format(
+                args.id, grant.get("package_name") or grant.get("package_id")
+            ), file=sys.stderr)
+            return 2
+        deleted = redis.delete("grant_{}".format(args.id))
+        print("Grants revoked: {}".format(deleted))
+        return 0 if deleted else 2
+
+    try:
+        subject, name = _subject_from_args(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    deleted = 0
+    package_managed = 0
+    for key in redis.keys("grant_*"):
+        grant = json.loads(decode(redis.get(key)))
+        if grant.get("subject") != subject or grant.get("name") != name:
+            continue
+        if args.project and grant.get("project") != args.project:
+            continue
+        if args.project_glob and grant.get("project_glob") != args.project_glob:
+            continue
+        if args.project_set and grant.get("project_set") != args.project_set:
+            continue
+        if args.host and grant.get("host") != args.host:
+            continue
+        if grant.get("managed_by") == "access_package":
+            package_managed += 1
+            continue
+        deleted += redis.delete(key)
+    print("Grants revoked: {}".format(deleted))
+    if package_managed:
+        print("Package-managed grants skipped: {}; use isolate package unassign/update".format(package_managed), file=sys.stderr)
+    return 0 if deleted else 2
+
+
+def cmd_grant_list(args, config):
+    redis = redis_client(config)
+    grants = list_grant_records(
+        redis,
+        user=args.user,
+        group=args.group,
+        project=args.project,
+        project_set=args.project_set,
+        project_glob=args.project_glob,
+    )
+    if args.json:
+        print(json.dumps(grants, indent=2, sort_keys=True))
+    else:
+        print(format_grants_table(grants))
+
+
+def cmd_grant_show(args, config):
+    redis = redis_client(config)
+    grant = get_grant_record(redis, args.id)
+    if grant is None:
+        print("Grant not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    if grant.get("managed_by") == "access_package":
+        print("Grant {} is managed by access package {}; update the package instead".format(
+            args.id, grant.get("package_name") or grant.get("package_id")
+        ), file=sys.stderr)
+        return 2
+    print(json.dumps(grant, indent=2, sort_keys=True))
+
+
+def cmd_grant_update(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    redis = redis_client(config)
+    selector_updates = {
+        "project": args.project,
+        "project_glob": args.project_glob,
+        "project_set": args.project_set,
+    }
+    selected = [key for key, value in selector_updates.items() if value is not None]
+    updates = {
+        "host": args.host,
+        "remote_user": args.remote_user,
+        "sudo_mode": args.sudo_mode,
+    }
+    if selected:
+        updates.update({"project": None, "project_glob": None, "project_set": None})
+        updates[selected[0]] = selector_updates[selected[0]]
+    if args.allowed_action is not None:
+        updates["allowed_actions"] = args.allowed_action
+
+    grant = get_grant_record(redis, args.id)
+    if grant is None:
+        print("Grant not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    grant.pop("id", None)
+    for key, value in updates.items():
+        if value is None and key in ("project", "project_glob", "project_set") and selected:
+            grant[key] = None
+        elif value is not None:
+            grant[key] = value
+    redis.set("grant_{}".format(args.id), json.dumps(grant, sort_keys=True))
+    grant["id"] = str(args.id)
+    print(json.dumps(grant, indent=2, sort_keys=True))
+
+
+def cmd_grant_test(args, config):
+    redis = redis_client(config)
+    identity = normalize_claims(
+        {
+            "sub": "test:{}".format(args.user),
+            "preferred_username": args.user,
+            "groups": args.group or [],
+        }
+    )
+    host = None
+    if args.host:
+        raw = redis.get("server_{}".format(args.host))
+        if raw is not None:
+            host = json.loads(decode(raw))
+        else:
+            host = {"server_id": args.host, "server_name": args.host}
+    defaults = {}
+    defaults.update(config.get("policy", {}))
+    defaults.update(config.get("ssh", {}))
+    try:
+        decision = resolve_grant(
+            identity,
+            project=args.project,
+            host=host,
+            grants=load_grants(redis),
+            project_sets=load_project_sets(redis),
+            defaults=defaults,
+        )
+        print(json.dumps(decision, indent=2, sort_keys=True))
+    except PolicyDenied as exc:
+        print(json.dumps({"denied": str(exc)}, indent=2, sort_keys=True))
+        return 2
+    return 0
+
+
+def _str2bool(value):
+    if value is None:
+        return None
+    value = str(value).strip().lower()
+    if value in ("1", "true", "yes", "y", "on"):
+        return True
+    if value in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
+@_managed_cli("inventory.read")
+def cmd_host_list(args, config):
+    try:
+        rows = list_hosts(redis_client(config), project=args.project, query=args.query,
+                          tags=normalize_tags(getattr(args, "tag", None)))
+        rows = _management_rows(rows, args._management_identity, config, "inventory.read", "project_name")
+    except HostValidationError as exc:
+        print("host list failed: {}".format(exc), file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    else:
+        print(format_hosts_table(rows))
+
+
+@_managed_cli("inventory.read")
+def cmd_host_show(args, config):
+    host = _management_host(redis_client(config), args.server_id, args._management_identity, config, "inventory.read")
+    if host is None:
+        print("Host not found: {}".format(args.server_id), file=sys.stderr)
+        return 2
+    print(json.dumps(host, indent=2, sort_keys=True))
+
+
+@_managed_cli("inventory.write")
+def cmd_host_update(args, config):
+    redis = redis_client(config)
+    previous = _management_host(redis, args.server_id, args._management_identity, config, "inventory.write")
+    updates = {
+        "project_name": args.project,
+        "server_name": args.name,
+        "server_ip": args.ip,
+        "server_port": args.port,
+        "server_user": args.user,
+        "server_nosudo": args.nosudo,
+        "server_vip": args.vip,
+        "server_services": args.services,
+        "server_note": args.note,
+        "resource_owner": getattr(args, "owner", None),
+        "environment": getattr(args, "environment", None),
+        "privileged_access_provider": args.privileged_provider,
+        "privileged_access_url": args.privileged_url,
+        "privileged_access_hint": args.privileged_hint,
+        "proxy_id": args.proxy_id,
+        "maintenance_enabled": getattr(args, "maintenance", None),
+        "maintenance_until": getattr(args, "maintenance_until", None),
+        "maintenance_reason": getattr(args, "maintenance_reason", None),
+    }
+    try:
+        if getattr(args, "tag", None) or getattr(args, "remove_tag", None) or getattr(args, "clear_tags", False):
+            tags = {} if getattr(args, "clear_tags", False) else normalize_tags(previous.get("tags"))
+            tags.update(normalize_tags(getattr(args, "tag", None)))
+            for key in getattr(args, "remove_tag", None) or []:
+                tags.pop(key, None)
+            updates["tags"] = tags
+        host = update_host(redis, args.server_id, updates, updated_by=args._management_identity.get("username"),
+                           authorize=_authorize_host_update(args._management_identity, config), expected_revision=previous.get("_revision"))
+    except (HostValidationError, ValueError) as exc:
+        print("host update failed: {}".format(exc), file=sys.stderr)
+        return 2
+    if host is None:
+        print("Host not found: {}".format(args.server_id), file=sys.stderr)
+        return 2
+    print(json.dumps(host, indent=2, sort_keys=True))
+
+
+@_managed_cli("inventory.read")
+def cmd_host_services_history(args, config):
+    redis = redis_client(config)
+    if _management_host(redis, args.server_id, args._management_identity, config, "inventory.read") is None:
+        print("Host not found: {}".format(args.server_id), file=sys.stderr)
+        return 2
+    rows = get_discovery_history(redis, args.server_id, limit=min(max(args.limit, 1), 1000))
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    else:
+        print("checked_at             added                         removed")
+        for row in rows:
+            checked_at = datetime.datetime.fromtimestamp(row.get("checked_at") or 0, datetime.timezone.utc).isoformat()
+            print("{}  {:<28} {}".format(checked_at, ", ".join(row.get("added") or []), ", ".join(row.get("removed") or [])))
+        if not rows:
+            print("No service changes recorded")
+
+
+@_managed_cli("inventory.write")
+def cmd_host_maintenance(args, config):
+    redis = redis_client(config)
+    host = _management_host(redis, args.server_id, args._management_identity, config, "inventory.write")
+    if host is None:
+        print("Host not found: {}".format(args.server_id), file=sys.stderr)
+        return 2
+    if args.clear:
+        updates = {"maintenance_enabled": False, "maintenance_until": None, "maintenance_reason": ""}
+    else:
+        if not args.reason:
+            print("host maintenance failed: --reason is required", file=sys.stderr)
+            return 2
+        try:
+            until = int(time.time()) + parse_duration(args.until) if args.until else None
+        except ValueError as exc:
+            print("host maintenance failed: {}".format(exc), file=sys.stderr)
+            return 2
+        updates = {"maintenance_enabled": True, "maintenance_until": until, "maintenance_reason": args.reason}
+    try:
+        result = update_host(redis, args.server_id, updates, updated_by=args._management_identity.get("username"),
+                             authorize=_authorize_host_update(args._management_identity, config), expected_revision=host.get("_revision"))
+    except (HostValidationError, ValueError) as exc:
+        print("host maintenance failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+@_managed_cli("inventory.write")
+def cmd_host_check(args, config):
+    redis = redis_client(config)
+    if not args.server_id and not args.project:
+        print("host check failed: server_id or --project is required", file=sys.stderr)
+        return 2
+    if args.server_id and args.project:
+        print("host check failed: use either server_id or --project", file=sys.stderr)
+        return 2
+    rows = [get_host(redis, args.server_id)] if args.server_id else list_hosts(redis, project=args.project)
+    rows = [row for row in rows if row is not None]
+    for row in rows:
+        _require_management_permission(args._management_identity, config, "inventory.write", row.get("project_name") or "")
+    if args.ssh and not _management_admin(args._management_identity, config):
+        raise AccessDenied("SSH authentication probes require a platform administrator")
+    if not rows:
+        print("No hosts found", file=sys.stderr)
+        return 2
+    max_hosts = int(config.get("connectivity", {}).get("max_hosts_per_check", 100))
+    if len(rows) > max_hosts:
+        print("host check refused: {} hosts exceeds configured maximum {}".format(len(rows), max_hosts), file=sys.stderr)
+        return 2
+    results = []
+    for host in rows:
+        try:
+            result = check_host(
+                host, config, timeout=args.timeout or config.get("connectivity", {}).get("default_timeout", 3),
+                ssh_auth=args.ssh, remote_user=args.user,
+            )
+            save_check(redis, result, ttl=config.get("connectivity", {}).get("result_ttl", 3600))
+            results.append(result)
+        except (ConnectivityError, ValueError) as exc:
+            results.append({"host_id": str(host.get("server_id") or ""), "ok": False, "error": str(exc)})
+    if args.json:
+        print(json.dumps(results, indent=2, sort_keys=True))
+    else:
+        print("host    tcp     ssh          duration  error")
+        for row in results:
+            print("{:<7} {:<7} {:<12} {:<9} {}".format(
+                row.get("host_id") or "", row.get("tcp") or "failed", row.get("ssh") or "not-checked",
+                "{}ms".format(row.get("duration_ms") or 0), row.get("error") or "",
+            ))
+    return 0 if all(row.get("ok") for row in results) else 2
+
+
+def cmd_announcement_list(args, config):
+    rows = list_announcements(redis_client(config), project=args.project, host=args.host, active_only=args.active)
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    else:
+        print("id    severity  project          host      expires       text")
+        for row in rows:
+            print("{:<5} {:<9} {:<16} {:<9} {:<13} {}".format(
+                row.get("id"), row.get("severity"), row.get("project") or "*", row.get("host") or "*",
+                row.get("expires_at") or "never", row.get("text"),
+            ))
+
+
+def cmd_announcement_add(args, config):
+    try:
+        if not config.get("announcements", {}).get("enabled", True):
+            raise AnnouncementError("announcements are disabled")
+        identity = _require_access_admin(config)
+        redis = redis_client(config)
+        if len(list_announcements(redis, active_only=True)) >= int(config.get("announcements", {}).get("max_active", 100)):
+            raise AnnouncementError("active announcement limit reached")
+        expires_at = int(time.time()) + parse_duration(args.ttl) if args.ttl else None
+        record = create_announcement(
+            redis, args.text, identity.get("username"), project=args.project, host=args.host,
+            severity=args.severity, expires_at=expires_at,
+        )
+    except (AccessDenied, IdentityError, AnnouncementError, ValueError) as exc:
+        print("announcement add failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_announcement_remove(args, config):
+    try:
+        _require_access_admin(config)
+        result = delete_announcement(redis_client(config), args.id)
+    except (AccessDenied, IdentityError, AnnouncementError) as exc:
+        print("announcement remove failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def _export_rows(kind, args, config):
+    identity = args._management_identity
+    redis = redis_client(config)
+    if kind == "inventory":
+        _require_management_permission(identity, config, "inventory.read")
+        return _management_rows(list_hosts(redis, project=args.project, query=args.query, tags=normalize_tags(getattr(args, "tag", None))),
+                                identity, config, "inventory.read", "project_name")
+    if kind not in ("inventory", "history") and not _management_admin(identity, config):
+        raise AccessDenied("this export requires a platform administrator")
+    if kind == "grants":
+        return list_grant_records(redis, project=args.project)
+    if kind == "users":
+        return list_user_profiles(config["logging"]["base_path"], archive_config=config, state_client=redis)
+    if kind == "history":
+        return read_history(
+            config["logging"]["base_path"], identity, archive_config=config, state_client=redis, query=args.query, user=args.user, project=args.project,
+            host=args.host, limit=min(args.limit, int(config.get("history", {}).get("max_limit", 100))),
+            admin_groups=identity.get("groups") if identity.get("_local_root") else config.get("history", {}).get("admin_groups") or config.get("dashboard", {}).get("admin_groups") or [],
+            permission_config=None if identity.get("_local_root") else config,
+            since=getattr(args, "since", None), until=getattr(args, "until", None), result=getattr(args, "result", None),
+        )
+    if kind == "access-matrix":
+        matrix = build_access_matrix(load_grants(redis), load_project_sets(redis), list_hosts(redis), defaults={**config.get("policy", {}), **config.get("ssh", {})})
+        return flatten_access_matrix(matrix)
+    raise ExportError("unknown export kind: {}".format(kind))
+
+
+@_managed_cli()
+def cmd_export(args, config):
+    try:
+        rows = _export_rows(args.kind, args, config)
+        content, _ = render_export(rows, args.format)
+        if args.output == "-":
+            sys.stdout.write(content)
+        else:
+            _write_private_file(args.output, content)
+            print("Exported {} rows to {}".format(len(rows), args.output))
+    except (ExportError, IdentityError, HistoryAccessDenied, HostValidationError, OSError, ValueError) as exc:
+        print("export failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_user_activity(args, config):
+    try:
+        identity = load_verified_identity(config)
+    except IdentityError as exc:
+        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+    username = args.username or identity.get("username")
+    admin_groups = config.get("history", {}).get("admin_groups") or config.get("dashboard", {}).get("admin_groups") or []
+    if username != identity.get("username") and not is_history_admin(identity, admin_groups):
+        print("user activity denied: other users are visible only to admins", file=sys.stderr)
+        return 2
+    redis = redis_client(config)
+    result = user_activity_summary(
+        config["logging"]["base_path"], username, limit=args.limit, archive_config=config, state_client=redis,
+        active_sessions=list_active_sessions(redis), grants=list_grant_records(redis),
+        access_requests=list_access_requests(redis),
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    metrics = result["metrics"]
+    print("User: {}".format(username))
+    print("Connections: {}  Active: {}  Recent failures: {}  Grants: {}  Requests: {}".format(
+        metrics["connections"], metrics["active_sessions"], metrics["recent_failures"],
+        metrics["grant_candidates"], metrics["access_requests"],
+    ))
+    if result["top_projects"]:
+        print("Top projects: {}".format(", ".join("{} ({})".format(row["project"], row["connections"]) for row in result["top_projects"])))
+    if result["recent_sessions"]:
+        print(format_history_table(result["recent_sessions"]))
+
+
+def cmd_grant_explain(args, config):
+    from isolate_access_explain import policy_explanation, ExplanationError
+    redis = redis_client(config)
+    host = get_host(redis, args.host) if args.host else None
+    identity = {"username": args.user, "groups": args.group or [], "roles": args.role or []}
+    if not args.group:
+        try:
+            current = load_verified_identity(config)
+            if not args.user or args.user == current.get("username"):
+                identity = current
+        except IdentityError:
+            pass
+    if args.user:
+        identity["username"] = args.user
+    # This command is an administrative policy simulation (main() enforces the
+    # platform-admin boundary). It never turns simulated groups into authority.
+    project = (host or {}).get("project_name") if host else args.project
+    action = getattr(args, 'action', 'ssh')
+    safe_host = {key: host[key] for key in ('server_id', 'server_name', 'project_name') if key in host} if host else None
+    output = {'allowed': False, 'user': identity.get('username'), 'groups': identity.get('groups') or [],
+        'project': args.project, 'host': None, 'action': action, 'snapshot_only': True, 'simulation': True}
+    try:
+        if args.host and host is None or host and args.project and args.project != project:
+            raise ExplanationError(404, 'resource_not_found_or_not_visible')
+        policy = policy_explanation(config, identity, host or {'project_name': project}, load_grants(redis),
+            load_project_sets(redis), action=action, admin=True)
+        output.update(policy=policy, reason_code=policy['reason_code'])
+        if policy['allowed']:
+            output.update(allowed=True, project=project, host=safe_host, remote_user=policy['remote_user'],
+                sudo_mode=policy['sudo_mode'], allowed_actions=policy['selected_grant']['allowed_actions'],
+                matched_grant=policy['selected_grant'])
+        else:
+            output['reason'] = 'The selected active rule does not allow this action.' if policy['reason_code'] == 'action_not_allowed' else 'No active policy assignment permits this request.'
+    except ExplanationError as exc:
+        output.update(reason_code=exc.code, reason='The resource or requested action is unavailable.')
+    if not output['allowed']:
+        output['suggested_request'] = 'isolate access request --project {}{} --reason <reason>'.format(
+            args.project or '<project>', ' --host {}'.format(args.host) if args.host else '')
+    print(json.dumps(output, indent=2, sort_keys=True))
+    return 0 if output['allowed'] else 2
+
+
+@_managed_cli()
+def cmd_history(args, config):
+    identity = args._management_identity
+
+    history_cfg = config.get("history", {})
+    default_limit = int(history_cfg.get("default_limit", 10))
+    max_limit = int(history_cfg.get("max_limit", 100))
+    limit = min(max(args.limit or default_limit, 1), max_limit)
+    try:
+        rows = read_history(
+            config["logging"]["base_path"],
+            identity,
+            archive_config=config,
+            query=args.query,
+            user=args.user,
+            project=args.project,
+            host=args.host,
+            limit=limit,
+            admin_groups=identity.get("groups") if identity.get("_local_root") else history_cfg.get("admin_groups") or config.get("dashboard", {}).get("admin_groups") or [],
+            permission_config=None if identity.get("_local_root") else config,
+            since=getattr(args, "since", None), until=getattr(args, "until", None), result=getattr(args, "result", None),
+        )
+    except (HistoryAccessDenied, ValueError) as exc:
+        print("history denied: {}".format(exc), file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    elif rows:
+        print(format_history_table(rows))
+    else:
+        print("No connection history found")
+
+
+def cmd_access_request(args, config):
+    try:
+        identity = _load_cli_identity()
+    except IdentityError as exc:
+        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+    redis = redis_client(config)
+    try:
+        record = create_access_request(
+            redis,
+            identity,
+            project=args.project,
+            host=args.host,
+            remote_user=args.remote_user,
+            sudo_mode=args.sudo_mode,
+            reason=args.reason,
+            ticket=args.ticket,
+            template=args.template,
+            config=config,
+            starts_at=parse_access_time(getattr(args, "starts_at", None)),
+            ends_at=parse_access_time(getattr(args, "ends_at", None)),
+        )
+    except (AccessDenied, ValueError) as exc:
+        print("access request failed: {}".format(exc), file=sys.stderr)
+        return 2
+    try:
+        notify_result = notify_access_event(config, "access_request_created", record, actor=identity)
+        _record_notification_status(redis, record["id"], result=notify_result)
+        record = get_access_request(redis, record["id"]) or record
+        _print_notification_warnings(notify_result)
+    except NotificationError as exc:
+        _record_notification_status(redis, record["id"], error=exc)
+        print("access request notification failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+@_managed_cli()
+def cmd_access_list(args, config):
+    redis = redis_client(config)
+    identity = args._management_identity
+    records = list_access_requests(redis, status=args.status, user=args.user, project=args.project, ticket=args.ticket)
+    records = [record for record in records if owns_access_request(record, identity)
+               or (record.get("project") and _management_allowed(identity, config, "access.read", record["project"]))]
+    if args.json:
+        print(json.dumps(records, indent=2, sort_keys=True))
+    else:
+        print(format_access_table(records))
+
+
+@_managed_cli()
+def cmd_access_show(args, config):
+    redis = redis_client(config)
+    record = get_access_request(redis, args.id)
+    if record is None:
+        print("Access request not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    identity = args._management_identity
+    if not owns_access_request(record, identity):
+        _require_management_permission(identity, config, "access.read", record.get("project") or "")
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+@_managed_cli("access.approve")
+def cmd_access_approve(args, config):
+    redis = redis_client(config)
+    try:
+        approver = args._management_identity
+        current = get_access_request(redis, args.id)
+        if current is None:
+            raise AccessDenied("access request was not found")
+        _require_management_permission(approver, config, "access.approve", current.get("project") or "")
+        access_cfg = config.get("access", {})
+        ttl = parse_duration(args.ttl, default=access_cfg.get("default_ttl", "2h"))
+        max_ttl = parse_duration(access_cfg.get("max_ttl", "24h"))
+        record, grant = approve_access_request(
+            redis,
+            args.id,
+            approver,
+            ttl,
+            remote_user=args.remote_user,
+            sudo_mode=args.sudo_mode,
+            max_ttl=max_ttl,
+            comment=args.comment,
+            starts_at=parse_access_time(getattr(args, "starts_at", None)),
+            config=None if approver.get("_local_root") else config,
+        )
+    except (AccessDenied, IdentityError, ValueError) as exc:
+        print("access approve failed: {}".format(exc), file=sys.stderr)
+        return 2
+    if record is None:
+        print("Access request not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    try:
+        notify_result = notify_access_event(config, "access_request_approved", record, actor=approver, extra={"grant": grant})
+        _record_notification_status(redis, record["id"], result=notify_result)
+        record = get_access_request(redis, record["id"]) or record
+        _print_notification_warnings(notify_result)
+    except NotificationError as exc:
+        _record_notification_status(redis, record["id"], error=exc)
+        print("access approve notification failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({"request": record, "grant": grant}, indent=2, sort_keys=True))
+
+
+@_managed_cli("access.approve")
+def cmd_access_deny(args, config):
+    redis = redis_client(config)
+    try:
+        approver = args._management_identity
+        current = get_access_request(redis, args.id)
+        if current is None:
+            raise AccessDenied("access request was not found")
+        _require_management_permission(approver, config, "access.approve", current.get("project") or "")
+        record = deny_access_request(redis, args.id, approver, reason=args.reason, comment=args.comment,
+                                     config=None if approver.get("_local_root") else config)
+    except (AccessDenied, IdentityError) as exc:
+        print("access deny failed: {}".format(exc), file=sys.stderr)
+        return 2
+    if record is None:
+        print("Access request not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    try:
+        notify_result = notify_access_event(config, "access_request_denied", record, actor=approver)
+        _record_notification_status(redis, record["id"], result=notify_result)
+        record = get_access_request(redis, record["id"]) or record
+        _print_notification_warnings(notify_result)
+    except NotificationError as exc:
+        _record_notification_status(redis, record["id"], error=exc)
+        print("access deny notification failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_access_comment(args, config):
+    redis = redis_client(config)
+    try:
+        identity = _load_cli_identity()
+    except IdentityError as exc:
+        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+    record = get_access_request(redis, args.id)
+    if record is None:
+        print("Access request not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    admin = is_access_admin(identity, config.get("access", {}).get("admin_groups") or [])
+    if record.get("requester") != identity.get("username") and not admin:
+        print("access comment denied: other users are visible only to admins", file=sys.stderr)
+        return 2
+    try:
+        record = comment_access_request(redis, args.id, identity, args.text, admin_groups=config.get("access", {}).get("admin_groups") or [])
+    except AccessDenied as exc:
+        print("access comment failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_access_repeat(args, config):
+    redis = redis_client(config)
+    try:
+        identity = _load_cli_identity()
+    except IdentityError as exc:
+        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+    old = get_access_request(redis, args.id)
+    if old is None:
+        print("Access request not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    admin = is_access_admin(identity, config.get("access", {}).get("admin_groups") or [])
+    if old.get("requester") != identity.get("username") and not admin:
+        print("access repeat denied: other users are visible only to admins", file=sys.stderr)
+        return 2
+    try:
+        record = repeat_access_request(redis, args.id, identity, reason=args.reason, ticket=args.ticket, config=config,
+                                       admin_groups=config.get("access", {}).get("admin_groups") or [])
+    except AccessDenied as exc:
+        print("access repeat failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def _finish_access_change(redis, config, identity, record, event):
+    if record is None:
+        raise AccessDenied("access request was not found")
+    prepare_and_dispatch({
+        "event": event, "ts": time.time(), "source": "isolate-cli",
+        "username": identity.get("username"), "request_id": record.get("id"),
+        "requester": record.get("requester"), "project": record.get("project"),
+        "host_id": record.get("host"), "result": record.get("status"),
+    }, config.get("logging", {}))
+    try:
+        result = notify_access_event(config, event, record, actor=identity)
+        _record_notification_status(redis, record["id"], result=result)
+        _print_notification_warnings(result)
+    except NotificationError as exc:
+        _record_notification_status(redis, record["id"], error=exc)
+        print("notification failed: {}".format(exc), file=sys.stderr)
+    print(json.dumps(get_access_request(redis, record["id"]) or record, indent=2, sort_keys=True))
+
+
+def cmd_access_cancel(args, config):
+    try:
+        identity = _load_cli_identity()
+        if not args.yes:
+            raise AccessDenied("explicit --yes is required to cancel a request")
+        redis = redis_client(config)
+        record = cancel_access_request(redis, args.id, identity)
+        _finish_access_change(redis, config, identity, record, "access_request_cancelled")
+    except (IdentityError, AccessDenied, ValueError, AuditSinkError) as exc:
+        print("access cancel failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+@_managed_cli("access.approve")
+def cmd_access_revoke(args, config):
+    try:
+        identity = args._management_identity
+        if not args.yes:
+            raise AccessDenied("explicit --yes is required to revoke access")
+        redis = redis_client(config)
+        current = get_access_request(redis, args.id)
+        if current is None:
+            raise AccessDenied("access request was not found")
+        _require_management_permission(identity, config, "access.approve", current.get("project") or "")
+        record = revoke_access_request(redis, args.id, identity,
+                                       admin_groups=identity.get("groups") if identity.get("_local_root") else config.get("access", {}).get("admin_groups") or [], reason=args.reason,
+                                       config=None if identity.get("_local_root") else config)
+        _finish_access_change(redis, config, identity, record, "access_request_revoked")
+    except (IdentityError, AccessDenied, ValueError, AuditSinkError) as exc:
+        print("access revoke failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_access_renew(args, config):
+    try:
+        identity = _load_cli_identity()
+        redis = redis_client(config)
+        record = renew_access_request(redis, args.id, identity, reason=args.reason, ticket=args.ticket,
+                                      starts_at=parse_access_time(args.starts_at), ends_at=parse_access_time(args.ends_at), config=config)
+        _finish_access_change(redis, config, identity, record, "access_request_created")
+    except (IdentityError, AccessDenied, ValueError, AuditSinkError) as exc:
+        print("access renew failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_command_log_append(args, config):
+    try:
+        audit_cfg = config.get("command_audit", {}) or {}
+        ingest_user = str(audit_cfg.get("ingest_user") or "auth")
+        if _effective_username() != ingest_user:
+            raise CommandAuditError("command audit ingest is restricted to the {} account".format(ingest_user))
+        if audit_cfg.get("require_active_session", True):
+            active = get_session(redis_client(config), args.connection_id)
+            grace = max(0, int(audit_cfg.get("completion_grace_seconds", 30)))
+            recent_completion = bool(
+                active
+                and active.get("status") == "completed"
+                and int(time.time()) - int(active.get("ended_at") or 0) <= grace
+            )
+            if not active or (active.get("status") != "active" and not recent_completion):
+                raise CommandAuditError("connection_id is not active")
+        record = append_command_event(
+            config["logging"]["base_path"],
+            args.connection_id,
+            args.command,
+            cwd=args.cwd,
+            exit_code=args.exit_code,
+            project=args.project,
+            host_id=args.host_id,
+            shell=args.shell,
+            source=args.source,
+            config=config,
+        )
+    except (CommandAuditError, ValueError) as exc:
+        print("command audit failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_jwks_refresh(args, config):
+    try:
+        from isolate_oidc import identity_provider_config
+        provider = identity_provider_config(config)
+        jwks = refresh_jwks_cache(provider)
+    except IdentityError as exc:
+        print("jwks refresh failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({"keys": len(jwks.get("keys") or []), "cache_path": provider.get("jwks_cache_path")}, indent=2, sort_keys=True))
+
+
+def _job_context():
+    """Bind operational CLI calls to root-managed configuration and the Unix user."""
+    from isolate_connection_auth import ConnectionDenied, bind_identity, trusted_config
+    from isolate_identity import _load_token_cache
+    from isolate_oidc import identity_provider_config
+
+    try:
+        if os.name != "posix":
+            raise ConnectionDenied("operational CLI commands require a Linux bastion")
+        config = trusted_config()
+        import pwd
+
+        username = pwd.getpwuid(os.getuid()).pw_name
+        token = _load_token_cache().get(identity_provider_config(config).get("token_kind", "id_token"))
+        identity = bind_identity(token, config, username, redis=redis_client(config))
+    except (ConnectionDenied, OSError) as exc:
+        raise AccessDenied(str(exc)) from exc
+    return config, identity
+
+
+def _delegation_options(config):
+    if not config.get("identity_security", {}).get("delegation", {}).get("enabled"):
+        return {}
+    from isolate_identity import _load_token_cache
+    from isolate_oidc import identity_provider_config
+    token = _load_token_cache().get(identity_provider_config(config).get("token_kind", "id_token"))
+    if not token:
+        raise IdentityError("verified credentials are required for job delegation")
+    return {"token": token}
+
+
+def _job_admin(identity, config):
+    groups = set(identity.get("groups") or [])
+    admins = set(config.get("dashboard", {}).get("admin_groups") or [])
+    admins.update(config.get("access", {}).get("admin_groups") or [])
+    return bool(groups & admins)
+
+
+def _owns_job(record, identity):
+    if record.get("keycloak_sub"):
+        return record["keycloak_sub"] == identity.get("keycloak_sub")
+    return bool(identity.get("username")) and record.get("username") == identity["username"]
+
+
+def _visible_job(redis, job_id, identity, config):
+    if not str(job_id).isdigit():
+        raise JobError("job id must be numeric")
+    record = get_job(redis, job_id)
+    if record is None or (not _owns_job(record, identity) and not _job_admin(identity, config)):
+        raise JobError("job was not found or is not visible")
+    if not _owns_job(record, identity):
+        _require_platform_admin(config)
+    return record
+
+
+def _audit_cli_job(config, identity, event, record):
+    prepare_and_dispatch({
+        "event": event, "source": "isolate-cli", "ts": time.time(),
+        "username": identity.get("username"), "job_id": record.get("id"),
+        "project": record.get("project"), "host_id": record.get("host_id"),
+    }, config.get("logging", {}))
+
+
+def cmd_job_list(args, config):
+    try:
+        config, identity = _job_context()
+        admin = _job_admin(identity, config)
+        if args.user and args.user != identity.get("username") and not admin:
+            raise JobError("other users' jobs are visible only to administrators")
+        user = args.user if admin else identity.get("username")
+        if admin and user != identity.get("username"):
+            _require_platform_admin(config)
+        limit = min(max(args.limit, 1), 1000)
+        rows = list_jobs(redis_client(config), user=user, status=args.status, limit=1000 if not admin else limit)
+        if not admin:
+            rows = [row for row in rows if _owns_job(row, identity)][:limit]
+        if args.json:
+            print(json.dumps(rows, indent=2, sort_keys=True))
+        else:
+            print("id      status       user               host      runbook          fleet")
+            for row in rows:
+                print("{:<7} {:<12} {:<18} {:<9} {:<16} {}".format(
+                    row.get("id"), row.get("status"), row.get("username"), row.get("host_id"),
+                    row.get("runbook_id") or row.get("type"), row.get("fleet_id") or ""))
+    except (IdentityError, AccessDenied, JobError, ValueError) as exc:
+        print("job list failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_job_show(args, config):
+    try:
+        config, identity = _job_context()
+        record = _visible_job(redis_client(config), args.id, identity, config)
+        print(json.dumps(record, indent=2, sort_keys=True))
+    except (IdentityError, AccessDenied, JobError, ValueError) as exc:
+        print("job show failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_job_output(args, config):
+    try:
+        config, identity = _job_context()
+        record = _visible_job(redis_client(config), args.id, identity, config)
+        execution = config.get("command_execution", {}) or {}
+        output = read_job_output(record, max_bytes=int(execution.get("max_return_bytes", 262144)),
+                                 jobs_path=execution.get("jobs_path", "/opt/auth/jobs"), job_id=args.id)
+        if args.json:
+            print(json.dumps({"job_id": args.id, "status": record.get("status"), "output": output,
+                              "output_truncated": bool(record.get("output_truncated") or record.get("output_bytes", 0) > int(execution.get("max_return_bytes", 262144)))}, indent=2, sort_keys=True))
+        else:
+            sys.stdout.write(output)
+    except (IdentityError, AccessDenied, JobError, ValueError, OSError) as exc:
+        print("job output failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_job_cancel(args, config):
+    try:
+        config, identity = _job_context()
+        redis = redis_client(config)
+        _visible_job(redis, args.id, identity, config)
+        if not args.yes:
+            raise JobError("explicit --yes is required to cancel a job")
+        record = request_job_cancel(redis, args.id, identity)
+        _audit_cli_job(config, identity, "job_cancel_requested", record)
+        print(json.dumps(record, indent=2, sort_keys=True))
+    except (IdentityError, AccessDenied, JobError, ValueError, AuditSinkError) as exc:
+        print("job cancel failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_job_retry(args, config):
+    try:
+        config, identity = _job_context()
+        redis = redis_client(config)
+        original = _visible_job(redis, args.id, identity, config)
+        if not args.yes:
+            raise JobError("explicit --yes is required to retry a job")
+        if _owns_job(original, identity):
+            record = retry_job(redis, config, args.id, identity, current_identity=identity, **_delegation_options(config))
+        else:
+            record = retry_job(redis, config, args.id, identity, **_delegation_options(config))
+        print(json.dumps(record, indent=2, sort_keys=True))
+    except (IdentityError, AccessDenied, JobError, ValueError, AuditSinkError) as exc:
+        print("job retry failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def _runbook_classes(identity, config):
+    runbooks = config.get("runbooks", {}) or {}
+    if not runbooks.get("enabled", False):
+        raise JobError("runbooks are disabled")
+    return [name for name in ("read_only", "operational")
+            if (name != "operational" or runbooks.get(name, {}).get("enabled", False))
+            and set(identity.get("groups") or []) & set(runbooks.get(name, {}).get("allowed_groups") or [])]
+
+
+def _runbook_parameters(values):
+    parameters = {}
+    for value in values or []:
+        if "=" not in value:
+            raise JobError("parameters must use name=value")
+        name, parameter = value.split("=", 1)
+        name = name.strip()
+        if not name or name in parameters:
+            raise JobError("parameter names must be nonempty and unique")
+        parameters[name] = parameter
+    return parameters
+
+
+def _runbook_host_ids(redis, args):
+    explicit = getattr(args, "host", None) or []
+    tags = normalize_tags(getattr(args, "tag", None))
+    project = getattr(args, "project", None)
+    if explicit and (project or tags):
+        raise JobError("use --host or --project/--tag selectors, not both")
+    if explicit:
+        return list(dict.fromkeys(host.strip() for value in explicit for host in value.split(",") if host.strip()))
+    if not project and not tags:
+        raise JobError("an explicit --host, --project, or --tag selector is required")
+    return [str(host["server_id"]) for host in list_hosts(redis, project=project, tags=tags)]
+
+
+def cmd_runbook(args, config):
+    try:
+        config, identity = _job_context()
+        classes = _runbook_classes(identity, config)
+        if not classes:
+            raise JobError("identity is not in an allowed runbook group")
+        redis = redis_client(config)
+        if args.runbook_command == "list":
+            rows = list_runbooks(config, classes=classes, store=redis)
+            if args.json:
+                print(json.dumps(rows, indent=2, sort_keys=True))
+            else:
+                print("id                   class         description")
+                for row in rows:
+                    print("{:<20} {:<13} {}".format(row["id"], row["class"], row.get("description") or row.get("title")))
+            return 0
+        runbook = get_runbook(config, args.runbook, store=redis)
+        if runbook is None or runbook["class"] not in classes:
+            raise JobError("runbook is unknown, disabled, or not allowed")
+        if args.runbook_command == "show":
+            print(json.dumps(runbook, indent=2, sort_keys=True))
+            return 0
+        host_ids = _runbook_host_ids(redis, args)
+        parameters = _runbook_parameters(args.param)
+        if args.timeout is not None and not 0 < args.timeout <= int(config.get("command_execution", {}).get("max_timeout", 900)):
+            raise JobError("timeout is outside the configured range")
+        if args.runbook_command == "preview":
+            rendered, planned, _ = _runbook_submission_plan(redis, config, identity, args.runbook, host_ids,
+                parameters=parameters, timeout=args.timeout, definition_sha256=runbook["definition_sha256"],
+                **_delegation_options(config))
+            print(json.dumps({"runbook": rendered["runbook"]["id"], "command": rendered["command"],
+                              "parameters": rendered["parameters"], "count": len(planned),
+                              "hosts": [{"host_id": str(host["server_id"]), "project": host.get("project_name"),
+                                         "remote_user": decision.get("remote_user"), "sudo_mode": decision.get("sudo_mode")}
+                                        for host, decision in planned]}, indent=2, sort_keys=True))
+        else:
+            if not args.yes:
+                raise JobError("explicit --yes is required; use runbook preview to inspect the fleet")
+            result = create_runbook_fleet(redis, config, identity, args.runbook, host_ids,
+                parameters=parameters, timeout=args.timeout, confirmed=True, definition_sha256=runbook["definition_sha256"],
+                **_delegation_options(config))
+            print(json.dumps(result, indent=2, sort_keys=True))
+    except (IdentityError, AccessDenied, JobError, RunbookError, HostValidationError, ValueError, AuditSinkError) as exc:
+        print("runbook {} failed: {}".format(args.runbook_command, exc), file=sys.stderr)
+        return 2
+
+
+def cmd_connect(args, config):
+    import asyncio
+    from isolate_client import ClientError, connect
+    try:
+        return asyncio.run(connect(config, args.host_id, args.command))
+    except (IdentityError, ClientError, OSError, ValueError) as exc:
+        print("Connection denied: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="isolate")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    login = sub.add_parser("login")
+    login.add_argument("--step-up", action="store_true", help="request fresh OIDC authentication at the configured assurance level")
+    login.set_defaults(func=cmd_login)
+    connect_parser = sub.add_parser("connect", help="connect through the authenticated native SSH gateway")
+    connect_parser.add_argument("host_id")
+    connect_parser.add_argument("--command", help="execute one command instead of opening an interactive terminal")
+    connect_parser.set_defaults(func=cmd_connect)
+
+    whoami = sub.add_parser("whoami")
+    whoami.set_defaults(func=cmd_whoami)
+
+    logout = sub.add_parser("logout")
+    logout.set_defaults(func=cmd_logout)
+
+    config_cmd = sub.add_parser("config")
+    config_sub = config_cmd.add_subparsers(dest="config_command", required=True)
+    config_validate = config_sub.add_parser("validate")
+    config_validate.add_argument("--check-paths", action="store_true")
+    config_validate.add_argument("--json", action="store_true")
+    config_validate.set_defaults(func=cmd_config_validate)
+
+    health = sub.add_parser("health")
+    health.add_argument("--json", action="store_true")
+    health.set_defaults(func=cmd_health)
+
+    audit = sub.add_parser("audit")
+    audit_sub = audit.add_subparsers(dest="audit_command", required=True)
+    audit_verify = audit_sub.add_parser("verify")
+    audit_verify.add_argument("--path", required=True)
+    audit_verify.add_argument("--key-file")
+    audit_verify.set_defaults(func=cmd_audit_verify)
+
+    backup = sub.add_parser("backup")
+    backup_sub = backup.add_subparsers(dest="backup_command", required=True)
+    backup_create = backup_sub.add_parser("create")
+    backup_create.add_argument("--output")
+    backup_create.add_argument("--include-logs", action="store_true", default=None)
+    backup_create.set_defaults(func=cmd_backup_create)
+    backup_list = backup_sub.add_parser("list")
+    backup_list.add_argument("--json", action="store_true")
+    backup_list.set_defaults(func=cmd_backup_list)
+    backup_verify = backup_sub.add_parser("verify")
+    backup_verify.add_argument("--archive", required=True)
+    backup_verify.set_defaults(func=cmd_backup_verify)
+    backup_restore = backup_sub.add_parser("restore")
+    backup_restore.add_argument("--archive", required=True)
+    backup_restore.add_argument("--target-root", required=True)
+    backup_restore.add_argument("--restore-redis", action="store_true")
+    backup_restore.add_argument("--skip-files", action="store_true")
+    backup_restore.add_argument("--redis-conflict", choices=["abort", "replace", "skip"], default="abort")
+    backup_restore.add_argument("--preserve-owner", action="store_true")
+    backup_restore.add_argument("--live", action="store_true")
+    backup_restore.add_argument("--yes", action="store_true")
+    backup_restore.set_defaults(func=cmd_backup_restore)
+
+    policy = sub.add_parser("policy")
+    policy_sub = policy.add_subparsers(dest="policy_command", required=True)
+
+    add = policy_sub.add_parser("add")
+    add.add_argument("--subject", choices=["user", "group"], required=True)
+    add.add_argument("--name", required=True)
+    add.add_argument("--project")
+    add.add_argument("--host")
+    add.add_argument("--remote-user", required=True)
+    add.add_argument("--sudo-mode", default="sudo-i")
+    add.add_argument("--allowed-action", action="append", default=["ssh"])
+    add.set_defaults(func=cmd_policy_add)
+
+    test = policy_sub.add_parser("test")
+    test.add_argument("--user", required=True)
+    test.add_argument("--group", action="append")
+    test.add_argument("--project")
+    test.add_argument("--host")
+    test.set_defaults(func=cmd_policy_test)
+
+    policy_export = policy_sub.add_parser("export")
+    policy_export.add_argument("--output", default="-")
+    policy_export.add_argument("--format", choices=["yaml", "json"], default="yaml")
+    policy_export.set_defaults(func=cmd_policy_export)
+
+    policy_validate = policy_sub.add_parser("validate")
+    policy_validate.add_argument("--file")
+    policy_validate.set_defaults(func=cmd_policy_validate)
+
+    policy_diff = policy_sub.add_parser("diff")
+    policy_diff.add_argument("--file")
+    policy_diff.add_argument("--prune", action="store_true")
+    policy_diff.set_defaults(func=cmd_policy_diff)
+
+    policy_apply = policy_sub.add_parser("apply")
+    policy_apply.add_argument("--file")
+    policy_apply.add_argument("--prune", action="store_true")
+    policy_apply.add_argument("--dry-run", action="store_true")
+    policy_apply.add_argument("--yes", action="store_true")
+    policy_apply.set_defaults(func=cmd_policy_apply)
+
+    policy_blast = policy_sub.add_parser("blast-radius")
+    policy_blast.add_argument("--file")
+    policy_blast.add_argument("--prune", action="store_true")
+    policy_blast.set_defaults(func=cmd_policy_blast_radius)
+
+    policy_drift = policy_sub.add_parser("drift")
+    policy_drift.add_argument("--file")
+    policy_drift.add_argument("--prune", action="store_true")
+    policy_drift.add_argument("--git", action="store_true")
+    policy_drift.set_defaults(func=cmd_policy_drift)
+
+    policy_sync = policy_sub.add_parser("sync")
+    policy_sync.add_argument("--dry-run", action="store_true")
+    policy_sync.add_argument("--yes", action="store_true")
+    policy_sync.set_defaults(func=cmd_policy_sync)
+
+    policy_revisions = policy_sub.add_parser("revisions")
+    policy_revisions.set_defaults(func=cmd_policy_revisions)
+
+    policy_attest = policy_sub.add_parser("attest")
+    policy_attest.add_argument("--file")
+    policy_attest.add_argument("--branch")
+    policy_attest.add_argument("--approver", action="append", required=True)
+    policy_attest.add_argument("--pr-url")
+    policy_attest.add_argument("--output", default="policy.approval.json")
+    policy_attest.set_defaults(func=cmd_policy_attest)
+
+    policy_rollback_parser = policy_sub.add_parser("rollback")
+    policy_rollback_parser.add_argument("--revision", required=True)
+    policy_rollback_parser.add_argument("--yes", action="store_true")
+    policy_rollback_parser.set_defaults(func=cmd_policy_rollback)
+
+    project_set = sub.add_parser("project-set")
+    project_set_sub = project_set.add_subparsers(dest="project_set_command", required=True)
+    ps_add = project_set_sub.add_parser("add")
+    ps_add.add_argument("name")
+    ps_add.add_argument("--project", action="append")
+    ps_add.add_argument("--project-glob", action="append")
+    ps_add.set_defaults(func=cmd_project_set_add)
+
+    ps_add_pattern = project_set_sub.add_parser("add-pattern")
+    ps_add_pattern.add_argument("name")
+    ps_add_pattern.add_argument("--project-glob", action="append", required=True)
+    ps_add_pattern.set_defaults(func=cmd_project_set_add)
+
+    ps_list = project_set_sub.add_parser("list")
+    ps_list.add_argument("--json", action="store_true")
+    ps_list.set_defaults(func=cmd_project_set_list)
+
+    ps_show = project_set_sub.add_parser("show")
+    ps_show.add_argument("name")
+    ps_show.set_defaults(func=cmd_project_set_show)
+
+    ps_remove = project_set_sub.add_parser("remove-project")
+    ps_remove.add_argument("name")
+    ps_remove.add_argument("project")
+    ps_remove.set_defaults(func=cmd_project_set_remove_project)
+
+    ps_remove_pattern = project_set_sub.add_parser("remove-pattern")
+    ps_remove_pattern.add_argument("name")
+    ps_remove_pattern.add_argument("project_glob")
+    ps_remove_pattern.set_defaults(func=cmd_project_set_remove_pattern)
+
+    ps_remove_set = project_set_sub.add_parser("remove")
+    ps_remove_set.add_argument("name")
+    ps_remove_set.set_defaults(func=cmd_project_set_remove)
+
+    grant = sub.add_parser("grant")
+    grant_sub = grant.add_subparsers(dest="grant_command", required=True)
+
+    grant_add = grant_sub.add_parser("add")
+    subject = grant_add.add_mutually_exclusive_group(required=True)
+    subject.add_argument("--user")
+    subject.add_argument("--group")
+    subject.add_argument("--service", help="Keycloak workload client ID; grants never match human identities")
+    selector = grant_add.add_mutually_exclusive_group(required=True)
+    selector.add_argument("--project")
+    selector.add_argument("--project-glob")
+    selector.add_argument("--project-set")
+    grant_add.add_argument("--host")
+    grant_add.add_argument("--remote-user", required=True)
+    grant_add.add_argument("--sudo-mode", default="sudo-i")
+    grant_add.add_argument("--allowed-action", action="append", default=["ssh"])
+    grant_add.set_defaults(func=cmd_grant_add)
+
+    grant_revoke = grant_sub.add_parser("revoke")
+    grant_revoke.add_argument("--id")
+    revoke_subject = grant_revoke.add_mutually_exclusive_group()
+    revoke_subject.add_argument("--user")
+    revoke_subject.add_argument("--group")
+    revoke_subject.add_argument("--service")
+    grant_revoke.add_argument("--project")
+    grant_revoke.add_argument("--project-glob")
+    grant_revoke.add_argument("--project-set")
+    grant_revoke.add_argument("--host")
+    grant_revoke.set_defaults(func=cmd_grant_revoke)
+
+    grant_list = grant_sub.add_parser("list")
+    grant_list.add_argument("--user")
+    grant_list.add_argument("--group")
+    grant_list.add_argument("--project")
+    grant_list.add_argument("--project-glob")
+    grant_list.add_argument("--project-set")
+    grant_list.add_argument("--json", action="store_true")
+    grant_list.set_defaults(func=cmd_grant_list)
+
+    grant_show = grant_sub.add_parser("show")
+    grant_show.add_argument("--id", required=True)
+    grant_show.set_defaults(func=cmd_grant_show)
+
+    grant_update = grant_sub.add_parser("update")
+    grant_update.add_argument("--id", required=True)
+    selector_update = grant_update.add_mutually_exclusive_group()
+    selector_update.add_argument("--project")
+    selector_update.add_argument("--project-glob")
+    selector_update.add_argument("--project-set")
+    grant_update.add_argument("--host")
+    grant_update.add_argument("--remote-user")
+    grant_update.add_argument("--sudo-mode")
+    grant_update.add_argument("--allowed-action", action="append")
+    grant_update.set_defaults(func=cmd_grant_update)
+
+    grant_test = grant_sub.add_parser("test")
+    grant_test.add_argument("--user", required=True)
+    grant_test.add_argument("--group", action="append")
+    grant_test.add_argument("--project")
+    grant_test.add_argument("--host")
+    grant_test.set_defaults(func=cmd_grant_test)
+
+    grant_explain = grant_sub.add_parser("explain")
+    grant_explain.add_argument("--user", required=True)
+    grant_explain.add_argument("--group", action="append")
+    grant_explain.add_argument("--role", action="append")
+    grant_explain.add_argument("--project")
+    grant_explain.add_argument("--host")
+    grant_explain.add_argument("--action", default="ssh", help="Explain an explicit protocol/operation action")
+    grant_explain.set_defaults(func=cmd_grant_explain)
+
+    package = sub.add_parser("package")
+    package_sub = package.add_subparsers(dest="package_command", required=True)
+
+    package_list = package_sub.add_parser("list")
+    package_list.add_argument("--status", choices=["enabled", "disabled"])
+    package_list.add_argument("--json", action="store_true")
+    package_list.set_defaults(func=cmd_package_list)
+
+    package_show = package_sub.add_parser("show")
+    package_show.add_argument("package")
+    package_show.set_defaults(func=cmd_package_show)
+
+    package_create = package_sub.add_parser("create")
+    package_create.add_argument("--file", required=True)
+    package_create.set_defaults(func=cmd_package_create)
+
+    package_preview = package_sub.add_parser("preview")
+    package_preview.add_argument("package")
+    package_preview.add_argument("--file", required=True)
+    package_preview.set_defaults(func=cmd_package_preview)
+
+    for command_name in ("update", "apply"):
+        package_update = package_sub.add_parser(command_name)
+        package_update.add_argument("package")
+        package_update.add_argument("--file", required=True)
+        package_update.add_argument("--expected-revision", type=int)
+        package_update.add_argument("--yes", action="store_true")
+        package_update.set_defaults(func=cmd_package_update)
+
+    package_assign = package_sub.add_parser("assign")
+    package_assign.add_argument("package")
+    package_assign.add_argument("--user", action="append")
+    package_assign.add_argument("--group", action="append")
+    package_assign.add_argument("--role", action="append")
+    package_assign.add_argument("--ticket")
+    duration = package_assign.add_mutually_exclusive_group()
+    duration.add_argument("--ttl")
+    duration.add_argument("--permanent", action="store_true")
+    package_assign.add_argument("--yes", action="store_true")
+    package_assign.set_defaults(func=cmd_package_assign)
+
+    package_assignments = package_sub.add_parser("assignments")
+    package_assignments.add_argument("--package")
+    package_assignments.add_argument("--subject", choices=["user", "group", "role"])
+    package_assignments.add_argument("--name")
+    package_assignments.add_argument("--all", action="store_true")
+    package_assignments.set_defaults(func=cmd_package_assignments)
+
+    package_unassign = package_sub.add_parser("unassign")
+    package_unassign.add_argument("--id", required=True)
+    package_unassign.add_argument("--yes", action="store_true")
+    package_unassign.set_defaults(func=cmd_package_unassign)
+
+    package_revisions = package_sub.add_parser("revisions")
+    package_revisions.add_argument("package")
+    package_revisions.set_defaults(func=cmd_package_revisions)
+
+    package_rollback = package_sub.add_parser("rollback")
+    package_rollback.add_argument("package")
+    package_rollback.add_argument("--revision", type=int, required=True)
+    package_rollback.add_argument("--expected-revision", type=int)
+    package_rollback.add_argument("--yes", action="store_true")
+    package_rollback.set_defaults(func=cmd_package_rollback)
+
+    host = sub.add_parser("host")
+    host_sub = host.add_subparsers(dest="host_command", required=True)
+    host_list = host_sub.add_parser("list")
+    host_list.add_argument("--project")
+    host_list.add_argument("--query")
+    host_list.add_argument("--tag", action="append", help="exact key=value tag filter; repeat for AND matching")
+    host_list.add_argument("--json", action="store_true")
+    host_list.set_defaults(func=cmd_host_list)
+
+    host_show = host_sub.add_parser("show")
+    host_show.add_argument("server_id")
+    host_show.set_defaults(func=cmd_host_show)
+
+    host_update = host_sub.add_parser("update")
+    host_update.add_argument("server_id")
+    host_update.add_argument("--project")
+    host_update.add_argument("--name")
+    host_update.add_argument("--ip")
+    host_update.add_argument("--port", type=int)
+    host_update.add_argument("--user")
+    host_update.add_argument("--nosudo", type=_str2bool)
+    host_update.add_argument("--vip", type=_str2bool)
+    host_update.add_argument("--services")
+    host_update.add_argument("--note")
+    host_update.add_argument("--owner", help="resource owner shown in the catalogue")
+    host_update.add_argument("--environment", help="environment shown in the catalogue")
+    host_update.add_argument("--tag", action="append", help="set a key=value tag while preserving other tags")
+    host_update.add_argument("--remove-tag", action="append", help="remove a tag by key")
+    host_update.add_argument("--clear-tags", action="store_true")
+    host_update.add_argument("--privileged-provider")
+    host_update.add_argument("--privileged-url")
+    host_update.add_argument("--privileged-hint")
+    host_update.add_argument("--proxy-id")
+    host_update.add_argument("--maintenance", type=_str2bool)
+    host_update.add_argument("--maintenance-until", type=int)
+    host_update.add_argument("--maintenance-reason")
+    host_update.set_defaults(func=cmd_host_update)
+
+    host_maintenance = host_sub.add_parser("maintenance")
+    host_maintenance.add_argument("server_id")
+    maintenance_action = host_maintenance.add_mutually_exclusive_group(required=True)
+    maintenance_action.add_argument("--until", help="duration such as 30m, 2h, or 1d")
+    maintenance_action.add_argument("--clear", action="store_true")
+    host_maintenance.add_argument("--reason")
+    host_maintenance.set_defaults(func=cmd_host_maintenance)
+
+    host_check = host_sub.add_parser("check")
+    host_check.add_argument("server_id", nargs="?")
+    host_check.add_argument("--project")
+    host_check.add_argument("--timeout", type=int)
+    host_check.add_argument("--ssh", action="store_true", help="also perform non-interactive public-key authentication")
+    host_check.add_argument("--user", help="remote user for --ssh")
+    host_check.add_argument("--json", action="store_true")
+    host_check.set_defaults(func=cmd_host_check)
+
+    services_history = host_sub.add_parser("services-history")
+    services_history.add_argument("server_id")
+    services_history.add_argument("--limit", type=int, default=20)
+    services_history.add_argument("--json", action="store_true")
+    services_history.set_defaults(func=cmd_host_services_history)
+
+    job = sub.add_parser("job", aliases=["jobs"])
+    job_sub = job.add_subparsers(dest="job_command", required=True)
+    job_list = job_sub.add_parser("list")
+    job_list.add_argument("--user")
+    job_list.add_argument("--status", choices=["queued", "claimed", "running", "recovery_required", "completed", "failed", "cancelled", "timed_out"])
+    job_list.add_argument("--limit", type=int, default=50)
+    job_list.add_argument("--json", action="store_true")
+    job_list.set_defaults(func=cmd_job_list)
+    for name, handler in (("show", cmd_job_show), ("output", cmd_job_output),
+                          ("cancel", cmd_job_cancel), ("retry", cmd_job_retry)):
+        command = job_sub.add_parser(name)
+        command.add_argument("id")
+        if name in ("cancel", "retry"):
+            command.add_argument("--yes", action="store_true")
+        if name == "output":
+            command.add_argument("--json", action="store_true")
+        command.set_defaults(func=handler)
+
+    runbook = sub.add_parser("runbook")
+    runbook_sub = runbook.add_subparsers(dest="runbook_command", required=True)
+    runbook_list = runbook_sub.add_parser("list")
+    runbook_list.add_argument("--json", action="store_true")
+    runbook_list.set_defaults(func=cmd_runbook)
+    runbook_show = runbook_sub.add_parser("show")
+    runbook_show.add_argument("runbook")
+    runbook_show.set_defaults(func=cmd_runbook)
+    for name in ("preview", "run"):
+        command = runbook_sub.add_parser(name)
+        command.add_argument("runbook")
+        command.add_argument("--host", action="append", help="host id or comma-separated ids; repeatable")
+        command.add_argument("--project")
+        command.add_argument("--tag", action="append", help="exact key=value selector; repeat for AND matching")
+        command.add_argument("--param", action="append", help="typed runbook parameter as name=value")
+        command.add_argument("--timeout", type=int)
+        if name == "run":
+            command.add_argument("--yes", action="store_true")
+        command.set_defaults(func=cmd_runbook)
+
+    session = sub.add_parser("session")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    search = session_sub.add_parser("search")
+    search.add_argument("--user")
+    search.add_argument("--project")
+    search.set_defaults(func=cmd_session_search)
+
+    session_terminate = session_sub.add_parser("terminate")
+    session_terminate.add_argument("connection_id")
+    session_terminate.add_argument("--reason")
+    session_terminate.add_argument("--yes", action="store_true")
+    session_terminate.set_defaults(func=cmd_session_terminate)
+
+    approval = session_sub.add_parser("approval")
+    approval_sub = approval.add_subparsers(dest="approval_command", required=True)
+    approval_list = approval_sub.add_parser("list")
+    approval_list.add_argument("--status", choices=["pending", "approved", "active", "denied", "revoked", "cancelled", "expired", "closed"])
+    approval_list.add_argument("--project")
+    approval_list.add_argument("--json", action="store_true")
+    approval_list.set_defaults(func=cmd_session_approval)
+    for name in ("show", "approve", "deny", "revoke"):
+        command = approval_sub.add_parser(name)
+        command.add_argument("id")
+        if name != "show":
+            command.add_argument("--reason")
+            command.add_argument("--yes", action="store_true")
+        command.set_defaults(func=cmd_session_approval)
+
+    history = sub.add_parser("history")
+    history.add_argument("query", nargs="?")
+    history.add_argument("--user")
+    history.add_argument("--project")
+    history.add_argument("--host")
+    history.add_argument("--since", help="Unix time or ISO 8601 date/time with timezone")
+    history.add_argument("--until", help="Unix time or ISO 8601 date/time with timezone")
+    history.add_argument("--result", help="connection result filter, such as success, failure, or exit=255")
+    history.add_argument("--limit", type=int)
+    history.add_argument("--json", action="store_true")
+    history.set_defaults(func=cmd_history)
+
+    export = sub.add_parser("export")
+    export.add_argument("kind", choices=["inventory", "grants", "history", "users", "access-matrix"])
+    export.add_argument("--format", choices=["json", "csv"], default="json")
+    export.add_argument("--output", default="-")
+    export.add_argument("--project")
+    export.add_argument("--host")
+    export.add_argument("--user")
+    export.add_argument("--query")
+    export.add_argument("--tag", action="append")
+    export.add_argument("--since")
+    export.add_argument("--until")
+    export.add_argument("--result")
+    export.add_argument("--limit", type=int, default=100)
+    export.set_defaults(func=cmd_export)
+
+    announcement = sub.add_parser("announcement")
+    announcement_sub = announcement.add_subparsers(dest="announcement_command", required=True)
+    announcement_list = announcement_sub.add_parser("list")
+    announcement_list.add_argument("--project")
+    announcement_list.add_argument("--host")
+    announcement_list.add_argument("--active", action="store_true")
+    announcement_list.add_argument("--json", action="store_true")
+    announcement_list.set_defaults(func=cmd_announcement_list)
+    announcement_add = announcement_sub.add_parser("add")
+    announcement_add.add_argument("--text", required=True)
+    announcement_add.add_argument("--project")
+    announcement_add.add_argument("--host")
+    announcement_add.add_argument("--severity", choices=["info", "warning", "critical"], default="info")
+    announcement_add.add_argument("--ttl")
+    announcement_add.set_defaults(func=cmd_announcement_add)
+    announcement_remove = announcement_sub.add_parser("remove")
+    announcement_remove.add_argument("--id", required=True)
+    announcement_remove.set_defaults(func=cmd_announcement_remove)
+
+    user = sub.add_parser("user")
+    user_sub = user.add_subparsers(dest="user_command", required=True)
+    user_activity = user_sub.add_parser("activity")
+    user_activity.add_argument("username", nargs="?")
+    user_activity.add_argument("--limit", type=int, default=10)
+    user_activity.add_argument("--json", action="store_true")
+    user_activity.set_defaults(func=cmd_user_activity)
+
+    command_log = sub.add_parser("command-log")
+    command_log_sub = command_log.add_subparsers(dest="command_log_command", required=True)
+    command_append = command_log_sub.add_parser("append")
+    command_append.add_argument("--connection-id", required=True)
+    command_append.add_argument("--host-id")
+    command_append.add_argument("--project")
+    command_append.add_argument("--cwd")
+    command_append.add_argument("--exit-code", type=int)
+    command_append.add_argument("--shell", default="unknown")
+    command_append.add_argument("--source", default="target-shell-hook")
+    command_append.add_argument("--command", required=True)
+    command_append.set_defaults(func=cmd_command_log_append)
+
+    access = sub.add_parser("access")
+    access_sub = access.add_subparsers(dest="access_command", required=True)
+    access_request = access_sub.add_parser("request")
+    access_request.add_argument("--project", required=True)
+    access_request.add_argument("--host")
+    access_request.add_argument("--remote-user")
+    access_request.add_argument("--sudo-mode")
+    access_request.add_argument("--reason", required=True)
+    access_request.add_argument("--ticket")
+    access_request.add_argument("--template")
+    access_request.add_argument("--starts-at", help="Unix time or ISO 8601 with explicit timezone")
+    access_request.add_argument("--ends-at", help="Unix time or ISO 8601 with explicit timezone")
+    access_request.set_defaults(func=cmd_access_request)
+
+    access_list = access_sub.add_parser("list")
+    access_list.add_argument("--status", choices=["pending", "approved", "denied", "cancelled", "revoked"])
+    access_list.add_argument("--user")
+    access_list.add_argument("--project")
+    access_list.add_argument("--ticket")
+    access_list.add_argument("--json", action="store_true")
+    access_list.set_defaults(func=cmd_access_list)
+
+    access_show = access_sub.add_parser("show")
+    access_show.add_argument("--id", required=True)
+    access_show.set_defaults(func=cmd_access_show)
+
+    access_approve = access_sub.add_parser("approve")
+    access_approve.add_argument("--id", required=True)
+    access_approve.add_argument("--ttl")
+    access_approve.add_argument("--remote-user")
+    access_approve.add_argument("--sudo-mode")
+    access_approve.add_argument("--comment")
+    access_approve.add_argument("--starts-at", help="override access start with Unix time or ISO 8601 with timezone")
+    access_approve.set_defaults(func=cmd_access_approve)
+
+    access_deny = access_sub.add_parser("deny")
+    access_deny.add_argument("--id", required=True)
+    access_deny.add_argument("--reason", required=True)
+    access_deny.add_argument("--comment")
+    access_deny.set_defaults(func=cmd_access_deny)
+
+    access_comment = access_sub.add_parser("comment")
+    access_comment.add_argument("--id", required=True)
+    access_comment.add_argument("--text", required=True)
+    access_comment.set_defaults(func=cmd_access_comment)
+
+    access_repeat = access_sub.add_parser("repeat")
+    access_repeat.add_argument("--id", required=True)
+    access_repeat.add_argument("--reason")
+    access_repeat.add_argument("--ticket")
+    access_repeat.set_defaults(func=cmd_access_repeat)
+
+    access_cancel = access_sub.add_parser("cancel")
+    access_cancel.add_argument("--id", required=True)
+    access_cancel.add_argument("--yes", action="store_true")
+    access_cancel.set_defaults(func=cmd_access_cancel)
+
+    access_revoke = access_sub.add_parser("revoke")
+    access_revoke.add_argument("--id", required=True)
+    access_revoke.add_argument("--reason", required=True)
+    access_revoke.add_argument("--yes", action="store_true")
+    access_revoke.set_defaults(func=cmd_access_revoke)
+
+    access_renew = access_sub.add_parser("renew")
+    access_renew.add_argument("--id", required=True)
+    access_renew.add_argument("--reason", required=True)
+    access_renew.add_argument("--ticket")
+    access_renew.add_argument("--starts-at")
+    access_renew.add_argument("--ends-at")
+    access_renew.set_defaults(func=cmd_access_renew)
+
+    jwks = sub.add_parser("jwks")
+    jwks_sub = jwks.add_subparsers(dest="jwks_command", required=True)
+    jwks_refresh = jwks_sub.add_parser("refresh")
+    jwks_refresh.set_defaults(func=cmd_jwks_refresh)
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    config = load_config()
+    if config.get("api", {}).get("client_url") and args.func in (cmd_history, cmd_whoami):
+        from isolate_client import APIClient, ClientError
+        try:
+            client = APIClient(config)
+            if args.func == cmd_whoami:
+                print(json.dumps(client.call("/api/v1/me"), indent=2, sort_keys=True))
+                return 0
+            import urllib.parse
+            values = {key: getattr(args, key, None) for key in ("query", "project", "host", "limit", "since", "until", "result")}
+            if getattr(args, "user", None):
+                raise ClientError("API console history is scoped to the signed identity")
+            rows = client.call("/api/v1/history?" + urllib.parse.urlencode({k: v for k, v in values.items() if v is not None}))["history"]
+            print(json.dumps(rows, indent=2, sort_keys=True) if getattr(args, "json", False) else format_history_table(rows))
+            return 0
+        except (ClientError, IdentityError, ValueError) as exc:
+            print("Isolate: {}".format(exc), file=sys.stderr)
+            return 2
+    try:
+        authorize_cli_command(args, config)
+    except (AccessDenied, IdentityError) as exc:
+        print("Administration denied: {}".format(exc), file=sys.stderr)
+        return 2
+    return args.func(args, config) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

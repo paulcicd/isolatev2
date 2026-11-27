@@ -1,0 +1,163 @@
+---
+- name: Read the target host public key over the provisioning connection
+  ansible.builtin.slurp:
+    src: "{{ isolate_enrollment_target_host_key_file }}"
+  become: true
+  register: _isolate_target_public_key
+
+- name: Read the Isolate service account public key from the bastion
+  ansible.builtin.slurp:
+    src: "{{ isolate_enrollment_bastion_identity_file }}.pub"
+  delegate_to: "{{ isolate_enrollment_bastion }}"
+  become: true
+  register: _isolate_bastion_public_key
+
+- name: Prepare the host key pin
+  ansible.builtin.set_fact:
+    _isolate_host_key_name: >-
+      {{ isolate_enrollment_ssh_address if isolate_enrollment_ssh_port | int == 22 else
+         '[' ~ isolate_enrollment_ssh_address ~ ']:' ~ isolate_enrollment_ssh_port }}
+    _isolate_host_key_parts: "{{ (_isolate_target_public_key.content | b64decode).split() }}"
+
+- name: Validate the provisioned host key
+  ansible.builtin.assert:
+    that:
+      - _isolate_host_key_parts | length >= 2
+      - _isolate_host_key_parts[0] == 'ssh-ed25519'
+      - _isolate_host_key_parts[1] is match('^AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}$')
+    fail_msg: The provisioned host-key file must contain an OpenSSH Ed25519 public key.
+
+- name: Prepare the known_hosts files on the bastion
+  ansible.builtin.copy:
+    content: ''
+    dest: "{{ item }}"
+    force: false
+    owner: root
+    group: "{{ isolate_enrollment_bastion_user }}"
+    mode: '0640'
+  loop: "{{ isolate_enrollment_known_hosts_files | unique | list }}"
+  delegate_to: "{{ isolate_enrollment_bastion }}"
+  become: true
+
+- name: Read existing pins for this address and port
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -F
+      - "{{ _isolate_host_key_name }}"
+      - -f
+      - "{{ item }}"
+  loop: "{{ isolate_enrollment_known_hosts_files | unique | list }}"
+  delegate_to: "{{ isolate_enrollment_bastion }}"
+  become: true
+  register: _isolate_existing_pins
+  changed_when: false
+  failed_when: >-
+    _isolate_existing_pins.rc not in [0, 1] or (_isolate_existing_pins.stderr | trim | length > 0)
+
+- name: Require review of existing changed or revoked host keys
+  ansible.builtin.assert:
+    that:
+      - item.stdout_lines | select('match', '^@revoked\s') | list | length == 0
+      - >-
+        item.stdout_lines | reject('match', '^#') | select('search', '\s+ssh-ed25519\s+')
+        | reject('search', '\s+ssh-ed25519\s+' ~ (_isolate_host_key_parts[1] | regex_escape) ~ '(\s|$)')
+        | list | length == 0
+    fail_msg: An existing pin for this server conflicts with the provisioned key. Review the key change in the bastion trust store.
+  loop: "{{ _isolate_existing_pins.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Authorize the Isolate service key for the target account
+  ansible.posix.authorized_key:
+    user: "{{ isolate_enrollment_ssh_user }}"
+    key: "{{ _isolate_bastion_public_key.content | b64decode | trim }}"
+    state: present
+  become: true
+
+- name: Pin the verified target key on the bastion
+  ansible.builtin.known_hosts:
+    name: "{{ _isolate_host_key_name }}"
+    key: "{{ _isolate_host_key_name }} {{ _isolate_host_key_parts[:2] | join(' ') }}"
+    path: "{{ item }}"
+    state: present
+  loop: "{{ isolate_enrollment_known_hosts_files | unique | list }}"
+  delegate_to: "{{ isolate_enrollment_bastion }}"
+  become: true
+
+- name: Verify the service key and host trust before registration
+  ansible.builtin.include_tasks: verify_ssh.yml
+  vars:
+    _isolate_probe_target: "{{ _isolate_host_spec }}"
+
+- name: Apply the confirmed inventory change
+  ansible.builtin.uri:
+    url: "{{ _isolate_hosts_url ~ ('/' ~ _isolate_existing_host.server_id if _isolate_existing_host else '') }}"
+    method: "{{ 'PUT' if _isolate_existing_host else 'POST' }}"
+    headers: >-
+      {{ {'Authorization': 'Bearer ' ~ isolate_enrollment_token}
+         | combine({'If-Match': _isolate_existing_host['_revision']} if _isolate_existing_host else
+                   {'Idempotency-Key': 'isolate-ansible-host-v1-' ~ (isolate_enrollment_external_id | hash('sha256'))}) }}
+    body_format: json
+    body:
+      host: "{{ _isolate_desired_host }}"
+      confirm: true
+    status_code: [200, 201, 409]
+    validate_certs: true
+    ca_path: "{{ isolate_enrollment_tls_ca_file | default(omit) }}"
+    follow_redirects: none
+    use_netrc: false
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  register: _isolate_registration
+  when: not _isolate_inventory_current
+  changed_when: _isolate_registration.status == 201 or (_isolate_existing_host | length > 0 and _isolate_registration.status == 200)
+  no_log: true
+
+- name: Stop on an inventory revision or create-intent conflict
+  ansible.builtin.assert:
+    that: _isolate_registration.status in [200, 201]
+    fail_msg: Isolate reported a conflict. Reconcile the inventory record and retry with its current revision.
+  when: not _isolate_inventory_current
+
+- name: Resolve the registered Isolate host ID
+  ansible.builtin.set_fact:
+    _isolate_registered_id: >-
+      {{ _isolate_existing_host.server_id if _isolate_inventory_current else _isolate_registration.json.host.server_id }}
+
+- name: Read back the registered inventory record
+  ansible.builtin.uri:
+    url: "{{ _isolate_hosts_url }}/{{ _isolate_registered_id }}"
+    headers:
+      Authorization: "Bearer {{ isolate_enrollment_token }}"
+    validate_certs: true
+    ca_path: "{{ isolate_enrollment_tls_ca_file | default(omit) }}"
+    follow_redirects: none
+    use_netrc: false
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  register: _isolate_registered
+  no_log: true
+
+- name: Verify the stored record matches the enrolled server
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_isolate_registered.json.host | dict2items | selectattr('key', 'in', _isolate_desired_host.keys())
+        | list | items2dict) == _isolate_desired_host
+    fail_msg: Isolate returned a different host record. Inspect the inventory before retrying.
+
+- name: Verify SSH using the registered host
+  ansible.builtin.include_tasks: verify_ssh.yml
+  vars:
+    _isolate_probe_target: "{{ _isolate_registered.json.host }}"
+
+- name: Report the Isolate inventory ID
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} is enrolled as Isolate host {{ _isolate_registered_id }}."

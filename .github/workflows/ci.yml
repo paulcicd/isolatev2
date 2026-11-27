@@ -1,0 +1,165 @@
+name: Verify access platform
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '24'
+      - name: Install Unix test prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y acl zsh
+          if ! getent passwd auth >/dev/null; then
+            sudo useradd --system --home-dir /var/lib/isolate --shell /usr/sbin/nologin auth
+          fi
+      - name: Install locked runtime and test fixtures
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-linux-py312.lock
+          awk '/^[a-z0-9]/{print $1}' requirements-linux-py312.lock > "$RUNNER_TEMP/runtime-constraints.txt"
+          python -m pip install -c "$RUNNER_TEMP/runtime-constraints.txt" -r requirements-dev.txt
+      - name: Install Windows test dependencies
+        if: runner.os == 'Windows'
+        run: python -m pip install -r requirements-dev.txt
+      - name: Verify compiled dashboard assets
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+          git diff --exit-code -- shared/static/dashboard.css shared/static/vendor/lucide
+      - name: Install verified kubectl protocol test client
+        if: runner.os == 'Linux'
+        run: |
+          curl --fail --silent --show-error --location https://dl.k8s.io/release/v1.31.3/bin/linux/amd64/kubectl -o /tmp/kubectl
+          echo '981f6b49577068bc174275184d8ee7105d8e54f40733792c519cd85023984c0f  /tmp/kubectl' | sha256sum -c -
+          sudo install /tmp/kubectl /usr/local/bin/kubectl
+      - run: python -m compileall -q shared scripts wrappers
+      - run: python -m unittest discover -s tests -v
+      - run: node tests/js/terminal-workspace.test.mjs
+      - run: node tests/js/precision-theme.test.mjs
+  deployment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install verified Helm test tool
+        run: |
+          curl --fail --silent --show-error --location https://get.helm.sh/helm-v3.17.2-linux-amd64.tar.gz -o /tmp/helm.tar.gz
+          echo '90c28792a1eb5fb0b50028e39ebf826531ebfcf73f599050dbd79bab2f277241  /tmp/helm.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/helm.tar.gz -C /tmp
+          sudo install /tmp/linux-amd64/helm /usr/local/bin/helm
+      - run: helm lint deploy/helm/isolate --strict
+      - run: helm template verify deploy/helm/isolate --set gateway.enabled=true,jobs.enabled=true,recordings.enabled=true > /tmp/isolate-rendered.yml
+      - name: Test and build Terraform provider
+        run: docker run --rm --mount "type=bind,source=$PWD/terraform-provider-isolate,target=/src,readonly" --workdir /src golang:1.26-alpine sh -c 'go test ./... && go build -o /tmp/terraform-provider-isolate .'
+      - run: docker build -f Dockerfile.prod -t isolate-production-check:local .
+      - run: docker run --rm isolate-production-check:local --help
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r tests/integration/ui/requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - run: python tests/integration/ui/ui_integration.py --output ui-verification
+      - run: python tests/integration/ui/web_apps_integration.py --output ui-verification
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: workspace-browser-screenshots
+          path: ui-verification/
+          if-no-files-found: warn
+  release-rehearsal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install release rehearsal prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server openssl
+          if ! getent passwd auth >/dev/null; then
+            sudo useradd --system --home-dir /var/lib/isolate --shell /usr/sbin/nologin auth
+          fi
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-linux-py312.lock
+      - name: Verify release service definitions
+        run: systemd-analyze verify --man=no deploy/systemd/release/*.service
+      - name: Rehearse installation, upgrade and rollback against loopback services
+        run: python tests/integration/release/release_integration.py
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Build isolated test environment
+        run: |
+          docker build -t isolate-v2-demo-bastion:latest -f demo/Dockerfile.bastion .
+          docker build -t isolate-gateway-tests:local -f tests/integration/gateway/Dockerfile .
+      - run: docker compose -f tests/integration/state/docker-compose.yml run --build --rm runner
+      - run: docker compose -f tests/integration/recordings/docker-compose.yml run --build --rm runner
+      - run: docker compose -f tests/integration/gateway/docker-compose.yml run --build --use-aliases --rm runner
+      - run: docker compose -f tests/integration/databases/docker-compose.yml run --build --rm runner
+      - name: Test Ansible enrollment and replay in an isolated container
+        run: |
+          docker build -f tests/integration/ansible/Dockerfile -t isolate-ansible-tests:local .
+          docker run --rm --network=none isolate-ansible-tests:local
+      - name: Remove isolated fixtures
+        if: always()
+        run: |
+          docker compose -f tests/integration/state/docker-compose.yml down --volumes --remove-orphans
+          docker compose -f tests/integration/recordings/docker-compose.yml down --volumes --remove-orphans
+          docker compose -f tests/integration/gateway/docker-compose.yml down --volumes --remove-orphans
+          docker compose -f tests/integration/databases/docker-compose.yml down --volumes --remove-orphans
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pip-audit
+      - run: python -m pip_audit -r requirements.txt --strict --format cyclonedx-json --output dependency-sbom.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: dependency-sbom
+          path: dependency-sbom.json
+          if-no-files-found: error

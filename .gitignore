@@ -1,0 +1,31 @@
+!.gitignore
+.githooks
+ansible/develop-hosts.ini
+keys/*
+logs/*
+cache/*
+backups/*
+spool/*
+*~
+.DS_Store
+.idea/
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.coverage
+**/.coverage
+.deploy
+add-support-user.sh
+
+# Local verification output
+.runtime/
+.baseline-*.log
+
+# Site-local credentials and environment files
+.env
+.env.*
+!.env.example
+ssh.env
+*.p12
+*.pfx

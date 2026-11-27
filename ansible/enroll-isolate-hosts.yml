@@ -1,0 +1,8 @@
+---
+- name: Enroll provisioned SSH hosts in Isolate
+  hosts: isolate_enrollment_targets
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  roles:
+    - isolate_host_enrollment

@@ -1,0 +1,47 @@
+---
+- import_tasks: ansible.yml
+  tags:
+  - ansible
+
+- import_tasks: apparmor.yml
+  tags: apparmor
+  when: ansible_os_family == "Debian"
+
+- import_tasks: ubuntu1604.yml
+  tags: ubuntu1604
+  when: GRUB_BOOT_DEVICE is defined and (ubuntu_1604 | default(False))
+
+- import_tasks: selinux.yml
+  tags: selinux
+  when: ansible_distribution == "CentOS"
+
+- import_tasks: upgrade-all.yml
+  tags: upgrade-all
+
+- import_tasks: utils.yml
+  tags: utils
+
+- import_tasks: ntpd.yml
+  tags:
+  - ntpd
+  - ntp
+
+- import_tasks: hostname.yml
+  tags: hostname
+
+- import_tasks: ulimit.yml
+  tags: ulimit
+
+- import_tasks: sysctl.yml
+  tags: sysctl
+
+- name: Apply ~/.nanorc...
+  copy: src=nanorc dest="~/.nanorc"
+  tags: nanorc
+
+- import_tasks: firewall.yml
+  tags: firewall
+
+
+- meta: flush_handlers
+  tags: always

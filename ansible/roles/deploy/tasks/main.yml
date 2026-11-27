@@ -1,0 +1,278 @@
+---
+- name: Ensure auth dir exist...
+  file: state=directory dest={{ deploy_path }} mode=0750 owner=auth group=auth
+
+- name: Pulling changes on remote server...
+  become: yes
+  become_user: auth
+  git: repo={{ git_repo }}
+    version={{ git_branch }}
+    dest={{ deploy_path }}
+    accept_hostkey=yes
+    force=no
+    recursive=yes
+    umask=077
+
+- name: Set deploy flag...
+  become: yes
+  become_user: auth
+  file:
+    path: "{{ deploy_path }}/.deploy"
+    state: touch
+    mode: "u+rw,g+rw,o-rwx"
+
+- name: Installing pip requirements.txt...
+  pip:
+    requirements: "{{ deploy_path }}/requirements.txt"
+    executable: pip3
+    extra_args: --break-system-packages
+    umask: "0022"
+
+- name: Executing deploy script...
+  shell: "bash --norc {{ deploy_path }}/scripts/fix-perms.sh"
+  become: yes
+  become_user: root
+
+- name: Installing Isolate systemd units...
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-dashboard.service", dest: "/etc/systemd/system/isolate-dashboard.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-log-retention.service", dest: "/etc/systemd/system/isolate-log-retention.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-log-retention.timer", dest: "/etc/systemd/system/isolate-log-retention.timer" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.service", dest: "/etc/systemd/system/isolate-backup.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.timer", dest: "/etc/systemd/system/isolate-backup.timer" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.service", dest: "/etc/systemd/system/isolate-mcp.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-job-worker.service", dest: "/etc/systemd/system/isolate-job-worker.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-policy-sync.service", dest: "/etc/systemd/system/isolate-policy-sync.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-policy-sync.timer", dest: "/etc/systemd/system/isolate-policy-sync.timer" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-service-discovery.service", dest: "/etc/systemd/system/isolate-service-discovery.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-service-discovery.timer", dest: "/etc/systemd/system/isolate-service-discovery.timer" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-dashboard.env", dest: "/etc/default/isolate-dashboard" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.env", dest: "/etc/default/isolate-mcp" }
+    - { src: "{{ deploy_path }}/deploy/logrotate/isolate", dest: "/etc/logrotate.d/isolate" }
+  when: isolate_install_runtime_units | bool
+
+- name: Installing Isolate backup systemd units...
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.service", dest: "/etc/systemd/system/isolate-backup.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.timer", dest: "/etc/systemd/system/isolate-backup.timer" }
+  when:
+    - isolate_enable_backup_timer | bool
+    - not (isolate_install_runtime_units | bool)
+
+- name: Installing Isolate MCP systemd unit...
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.service", dest: "/etc/systemd/system/isolate-mcp.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.env", dest: "/etc/default/isolate-mcp" }
+  when:
+    - isolate_enable_mcp_server | bool
+    - not (isolate_install_runtime_units | bool)
+
+- name: Installing Isolate command job worker unit...
+  copy:
+    src: "{{ deploy_path }}/deploy/systemd/isolate-job-worker.service"
+    dest: "/etc/systemd/system/isolate-job-worker.service"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - isolate_enable_job_worker | bool
+    - not (isolate_install_runtime_units | bool)
+
+- name: Installing Isolate policy sync units...
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-policy-sync.service", dest: "/etc/systemd/system/isolate-policy-sync.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-policy-sync.timer", dest: "/etc/systemd/system/isolate-policy-sync.timer" }
+  when:
+    - isolate_enable_policy_sync_timer | bool
+    - not (isolate_install_runtime_units | bool)
+
+- name: Checking Isolate command job signing key...
+  stat:
+    path: "{{ deploy_path }}/keys/job_hmac.key"
+  register: isolate_job_signing_key
+  when: isolate_enable_job_worker | bool
+
+- name: Generating Isolate command job signing key...
+  command: openssl rand -hex 32
+  register: isolate_job_signing_key_generated
+  changed_when: true
+  no_log: true
+  when:
+    - isolate_enable_job_worker | bool
+    - not (isolate_job_signing_key.stat.exists | default(false))
+
+- name: Installing Isolate command job signing key...
+  copy:
+    content: "{{ isolate_job_signing_key_generated.stdout }}\n"
+    dest: "{{ deploy_path }}/keys/job_hmac.key"
+    owner: auth
+    group: auth
+    mode: "0600"
+  no_log: true
+  when:
+    - isolate_enable_job_worker | bool
+    - not (isolate_job_signing_key.stat.exists | default(false))
+
+- name: Checking Isolate policy approval key...
+  stat:
+    path: "{{ deploy_path }}/keys/policy_approval_hmac.key"
+  register: isolate_policy_approval_key
+  when: isolate_enable_policy_sync_timer | bool
+
+- name: Generating Isolate policy approval key...
+  command: openssl rand -hex 32
+  register: isolate_policy_approval_key_generated
+  changed_when: true
+  no_log: true
+  when:
+    - isolate_enable_policy_sync_timer | bool
+    - not (isolate_policy_approval_key.stat.exists | default(false))
+
+- name: Installing Isolate policy approval key...
+  copy:
+    content: "{{ isolate_policy_approval_key_generated.stdout }}\n"
+    dest: "{{ deploy_path }}/keys/policy_approval_hmac.key"
+    owner: auth
+    group: auth
+    mode: "0600"
+  no_log: true
+  when:
+    - isolate_enable_policy_sync_timer | bool
+    - not (isolate_policy_approval_key.stat.exists | default(false))
+
+- name: Checking Isolate dashboard secret...
+  stat:
+    path: "{{ deploy_path }}/keys/dashboard_secret"
+  register: isolate_dashboard_secret
+  when: isolate_install_runtime_units | bool
+
+- name: Generating Isolate dashboard secret...
+  command: openssl rand -hex 32
+  register: isolate_dashboard_secret_generated
+  changed_when: true
+  no_log: true
+  when:
+    - isolate_install_runtime_units | bool
+    - not (isolate_dashboard_secret.stat.exists | default(false))
+
+- name: Installing Isolate dashboard secret...
+  copy:
+    content: "{{ isolate_dashboard_secret_generated.stdout }}\n"
+    dest: "{{ deploy_path }}/keys/dashboard_secret"
+    owner: auth
+    group: auth
+    mode: "0600"
+  no_log: true
+  when:
+    - isolate_install_runtime_units | bool
+    - not (isolate_dashboard_secret.stat.exists | default(false))
+
+- name: Enabling Isolate runtime services...
+  systemd:
+    name: "{{ item }}"
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  loop:
+    - isolate-dashboard.service
+    - isolate-log-retention.timer
+  when: isolate_install_runtime_units | bool
+
+- name: Enabling Isolate backup timer...
+  systemd:
+    name: isolate-backup.timer
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: isolate_enable_backup_timer | bool
+
+- name: Enabling Isolate MCP server...
+  systemd:
+    name: isolate-mcp.service
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: isolate_enable_mcp_server | bool
+
+- name: Enabling Isolate command job worker...
+  systemd:
+    name: isolate-job-worker.service
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: isolate_enable_job_worker | bool
+
+- name: Enabling Isolate policy sync timer...
+  systemd:
+    name: isolate-policy-sync.timer
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: isolate_enable_policy_sync_timer | bool
+
+- name: Installing optional service discovery units...
+  copy:
+    src: "{{ deploy_path }}/deploy/systemd/{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - isolate-service-discovery.service
+    - isolate-service-discovery.timer
+  when: isolate_enable_service_discovery_timer | bool
+
+- name: Enabling optional service discovery timer...
+  systemd:
+    name: isolate-service-discovery.timer
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: isolate_enable_service_discovery_timer | bool
+
+- name: Copying public key ...
+  shell: "cat /home/{{ auth_default_user }}/.ssh/id_rsa.pub"
+  register: pub_key
+
+- set_fact:
+    support_key: "{{ pub_key['stdout'] }}"
+#
+#- name: Copying add-support-user.sh template...
+#  template: src=add-support-user.sh dest=/opt/auth/add-support-user.sh mode=644 owner={{ auth_default_user }} group={{ auth_default_user }}
+
+- name: Unset deploy flag...
+  become: yes
+  become_user: auth
+  file:
+    path: "{{ deploy_path }}/.deploy"
+    state: absent

@@ -1,0 +1,11 @@
+---
+isolate_enrollment_token: "{{ lookup('ansible.builtin.env', 'ISOLATE_TOKEN') }}"
+isolate_enrollment_ssh_address: "{{ ansible_host }}"
+isolate_enrollment_ssh_port: "{{ ansible_port | default(22) }}"
+isolate_enrollment_server_name: "{{ inventory_hostname | lower }}"
+isolate_enrollment_tags: {}
+isolate_enrollment_target_host_key_file: /etc/ssh/ssh_host_ed25519_key.pub
+isolate_enrollment_bastion_user: auth
+isolate_enrollment_bastion_identity_file: /home/auth/.ssh/id_ed25519
+isolate_enrollment_known_hosts_files:
+  - /opt/auth/known_hosts

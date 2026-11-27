@@ -1,0 +1,14 @@
+{
+  "name": "isolate-dashboard-ui",
+  "private": true,
+  "scripts": {
+    "build:css": "tailwindcss -i ./ui/dashboard.css -o ./shared/static/dashboard.css --minify",
+    "build:icons": "node ./scripts/build-ui-icons.mjs",
+    "build": "npm run build:icons && npm run build:css"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "4.3.5",
+    "lucide-static": "1.71.0",
+    "tailwindcss": "4.3.5"
+  }
+}

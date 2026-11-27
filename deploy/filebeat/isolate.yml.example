@@ -1,0 +1,13 @@
+filebeat.inputs:
+  - type: filestream
+    id: isolate-audit
+    paths:
+      - /opt/auth/spool/events.jsonl
+    parsers:
+      - ndjson:
+          target: ""
+          add_error_key: true
+
+# Configure the approved Elasticsearch/Logstash/OpenSearch-compatible output.
+output.logstash:
+  hosts: ["logstash.example.org:5044"]

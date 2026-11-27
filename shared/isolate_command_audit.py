@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Structured command audit helpers."""
+
+import os
+import time
+
+from isolate_audit import append_jsonl_record, prepare_and_dispatch
+from isolate_replay import find_session
+from isolate_command_events import command_fields
+
+
+class CommandAuditError(Exception):
+    pass
+
+
+def _first_context(events):
+    for event in events:
+        if event.get("event") in ("policy_selected", "ssh_start", "ssh_end"):
+            return event
+    return events[0] if events else {}
+
+
+def append_command_event(base_path, connection_id, command, cwd=None, exit_code=None, project=None, host_id=None, shell=None, source=None, config=None):
+    audit_cfg = (config or {}).get("command_audit", {})
+    if not audit_cfg.get("enabled", False):
+        raise CommandAuditError("command audit is disabled")
+    if audit_cfg.get("require_connection_id", True) and not connection_id:
+        raise CommandAuditError("connection_id is required")
+
+    details = find_session(base_path, connection_id)
+    if details is None:
+        raise CommandAuditError("session not found for connection_id {}".format(connection_id))
+
+    command = str(command or "")
+    max_len = int(audit_cfg.get("max_command_length", 4096))
+    truncated = False
+    if len(command) > max_len:
+        command = command[:max_len]
+        truncated = True
+
+    events = details.get("events") or []
+    context = _first_context(events)
+    for field, supplied in (("project", project), ("host_id", host_id)):
+        trusted = context.get(field)
+        if trusted not in (None, "") and supplied not in (None, "") and str(supplied) != str(trusted):
+            raise CommandAuditError("{} does not match the session context".format(field))
+    record = {
+        "ts": time.time(),
+        "event": "command",
+        "session_id": context.get("session_id"),
+        "connection_id": connection_id,
+        "keycloak_sub": context.get("keycloak_sub"),
+        "username": context.get("username"),
+        "groups": context.get("groups", []),
+        "project": context.get("project") or project,
+        "host_id": context.get("host_id") or host_id,
+        "cwd": cwd,
+        "command": command,
+        "command_truncated": truncated,
+        "exit_code": int(exit_code) if exit_code is not None else None,
+        "shell": shell or "unknown",
+        "source": source or "target-shell-hook",
+    }
+    record.update(command_fields(command, exit_code=record["exit_code"], at=record["ts"],
+                                 audit_scope="shell_hook", audit_complete=False,
+                                 command_status="reported", timestamp_kind="received"))
+    record = prepare_and_dispatch(record, (config or {}).get("logging", {}))
+    append_jsonl_record(details["session_path"], record, mode=0o660)
+    if os.name == "posix":
+        try:
+            os.chmod(details["session_path"], 0o660)
+        except PermissionError:
+            pass
+    return record

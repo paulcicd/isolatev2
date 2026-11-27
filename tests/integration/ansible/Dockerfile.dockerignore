@@ -1,0 +1,16 @@
+**
+!requirements-linux-py312.lock
+!ansible/
+!ansible/enroll-isolate-hosts.yml
+!ansible/roles/
+!ansible/roles/isolate_host_enrollment/
+!ansible/roles/isolate_host_enrollment/**
+!shared/
+!shared/**
+!tests/
+!tests/test_admin_api.py
+!tests/integration/
+!tests/integration/ansible/
+!tests/integration/ansible/*.py
+**/__pycache__
+**/*.pyc

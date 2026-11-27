@@ -1,0 +1,23 @@
+---
+all:
+  vars:
+    isolate_enrollment_api_origin: https://isolate.example.org
+    isolate_enrollment_bastion: isolate-admin
+    isolate_enrollment_ssh_user: support
+    isolate_enrollment_known_hosts_files:
+      - /opt/auth/known_hosts
+      - /var/lib/isolate/gateway/known_hosts
+  hosts:
+    isolate-admin:
+      ansible_host: 192.0.2.10
+      ansible_user: automation
+  children:
+    isolate_enrollment_targets:
+      hosts:
+        payment-api-01:
+          ansible_host: 192.0.2.20
+          ansible_user: automation
+          isolate_enrollment_external_id: cmdb-payments-api-0001
+          isolate_enrollment_project: payments
+          isolate_enrollment_tags:
+            environment: stage

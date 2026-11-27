@@ -1,0 +1,303 @@
+schema_version: 2
+data_root: /opt/auth
+
+redis:
+  host: 127.0.0.1
+  port: 6379
+  db: 0
+  username: null
+  password: null
+  ssl: false
+  ssl_ca_certs: null
+  ssl_certfile: null
+  ssl_keyfile: null
+  ssl_check_hostname: true
+  socket_timeout: 3
+
+keycloak:
+  issuer: null
+  client_id: isolate-bastion
+  client_secret: null
+  scopes:
+    - openid
+    - profile
+    - email
+  poll_timeout: 300
+  tls_verify: true
+
+dashboard:
+  enabled: false
+  listen_host: 127.0.0.1
+  listen_port: 8080
+  public_url: http://127.0.0.1:8080
+  secret_key_file: /opt/auth/keys/dashboard_secret
+  admin_groups: []
+  refresh_seconds: 15
+  # Verified users can access only their own resources through /me routes.
+  self_service_enabled: true
+  # Empty means every verified identity; otherwise require an exact OIDC group.
+  self_service_groups: []
+  # Management roles use verified OIDC groups and never grant SSH access.
+  role_bindings: []
+  # - group: Payments-Approvers
+  #   role: approver
+  #   projects: [payments-prod]
+  require_mutation_confirmation: true
+  jobs_max_results: 250
+  default_locale: en
+
+build:
+  version: 2.1.0-dev
+  revision: null
+  built_at: null
+
+maintenance:
+  # Connections to hosts in maintenance are denied unless the verified identity belongs to a bypass group.
+  enforce: true
+  bypass_groups: []
+
+connectivity:
+  default_timeout: 3
+  max_hosts_per_check: 100
+  result_ttl: 3600
+
+announcements:
+  enabled: true
+  max_active: 100
+
+access_packages:
+  enabled: true
+  max_rules: 50
+  max_assignments_per_operation: 100
+
+# Per-connection approval is enforced at the trusted SSH wrapper before launch.
+session_approval:
+  enabled: false
+  required_projects: []
+  required_project_globs: []
+  require_privileged: false
+  minimum_approvals: 1
+  privileged_minimum_approvals: 2
+  request_timeout_seconds: 300
+  approval_ttl_seconds: 300
+  max_session_seconds: 3600
+  poll_interval_seconds: 2
+
+command_audit:
+  enabled: false
+  # managed: durable audit of every submitted command, no remote interactive stdin.
+  # target-hooks: legacy, partial audit requiring target-side integration.
+  mode: target-hooks
+  command_timeout_seconds: 300
+  require_connection_id: true
+  require_active_session: true
+  completion_grace_seconds: 30
+  max_command_length: 4096
+  # Requires the target-side installer and sshd AcceptEnv configuration.
+  send_env: false
+  # Only this effective Unix account may append target-shell command events.
+  ingest_user: auth
+
+session_control:
+  enabled: true
+  terminate_enabled: false
+  poll_interval: 1
+  heartbeat_interval: 15
+  active_ttl: 86400
+  live_tail_bytes: 262144
+  alerts:
+    enabled: false
+    long_session_seconds: 14400
+    vip: true
+    privileged: true
+    unusual_source: true
+    trusted_source_cidrs: []
+
+mcp:
+  enabled: false
+  listen_host: 127.0.0.1
+  listen_port: 8090
+  public_url: http://127.0.0.1:8090/mcp
+  # issuer inherits keycloak.issuer when null.
+  issuer: null
+  expected_audience: isolate-mcp
+  jwks_uri: null
+  jwks_cache_path: /opt/auth/cache/keycloak_mcp_jwks.json
+  jwks_cache_ttl: 3600
+  tls_verify: true
+  required_scopes:
+    - isolate.read
+  self_service_scope: isolate.self-service
+  approval_scope: isolate.approve
+  inventory_write_scope: isolate.inventory.write
+  policy_read_scope: isolate.policy.read
+  execute_scope: isolate.execute
+  runbook_scope: isolate.runbook
+  operate_scope: isolate.operate
+  # Empty lists inherit access.admin_groups.
+  inventory_admin_groups: []
+  policy_admin_groups: []
+  execution_admin_groups: []
+  prevent_self_approval: true
+  require_mutation_confirmation: true
+  allowed_hosts:
+    - 127.0.0.1:*
+    - localhost:*
+    - "[::1]:*"
+  allowed_origins:
+    - http://127.0.0.1:*
+    - http://localhost:*
+    - "http://[::1]:*"
+  max_results: 100
+  max_request_body_size: 1048576
+
+command_execution:
+  enabled: false
+  allowed_groups: []
+  allow_arbitrary_commands: false
+  allowed_command_patterns: []
+  allow_sudo: false
+  require_confirmation: true
+  default_timeout: 60
+  max_timeout: 900
+  max_command_length: 4096
+  max_output_bytes: 1048576
+  max_return_bytes: 262144
+  jobs_path: /opt/auth/jobs
+  signing_key_file: /opt/auth/keys/job_hmac.key
+  remote_shell: /bin/sh
+  poll_interval: 1
+
+runbooks:
+  enabled: false
+  max_fleet_hosts: 100
+  # Built-ins can be removed from the MCP catalog by id without editing code.
+  disabled: []
+  read_only:
+    allowed_groups: []
+    allow_sudo: false
+    require_confirmation: true
+  # Keep operational runbooks disabled until their grants and sudo policy pass review.
+  operational:
+    enabled: false
+    allowed_groups: []
+    allow_sudo: false
+    require_confirmation: true
+
+ssh:
+  binary: /usr/bin/ssh
+  config_path: /opt/auth/configs/defaults.conf
+  allow_unknown_args: false
+  allowed_extra_args:
+    - -4
+    - -6
+    - -A
+    - -a
+    - -C
+    - -v
+    - -vv
+    - -vvv
+  default_remote_user: null
+  default_sudo_mode: sudo-i
+  require_known_hosts: true
+  allocate_tty: true
+
+logging:
+  base_path: /opt/auth/logs
+  jsonl_name: session.jsonl
+  sink: local
+  fail_closed: false
+  retention_days: 90
+  sinks: []
+  integrity:
+    enabled: false
+    key_file: /opt/auth/keys/audit_hmac.key
+    key_id: isolate-audit-v1
+
+policy:
+  default_allowed_actions:
+    - ssh
+  fallback_remote_user: null
+
+policy_as_code:
+  bundle_path: /opt/auth/configs/policy.yml
+  backup_dir: /opt/auth/backups
+  require_confirmation: true
+  # Git synchronization is fully opt-in. enforce_git also disables manual policy mutations.
+  enabled: false
+  enforce_git: false
+  repository: null
+  checkout_path: /opt/auth/cache/policy-repo
+  branch: main
+  git_bundle_path: policy.yml
+  git_binary: /usr/bin/git
+  git_timeout: 60
+  prune: false
+  require_pr_approval: true
+  approval_attestation_path: policy.approval.json
+  approval_key_file: /opt/auth/keys/policy_approval_hmac.key
+  minimum_approvals: 1
+
+backup:
+  base_path: /opt/auth/backups/service
+  retention_count: 14
+  include_logs: false
+  owner: auth
+  group: auth
+  # Optional Redis credential override for backup/restore jobs. A dedicated
+  # ACL user can be granted DUMP/PTTL for create and RESTORE for recovery.
+  redis: {}
+  redis_patterns:
+    - server_*
+    - host_services_*
+    - grant_*
+    - policy_*
+    - project_set_*
+    - access_request_*
+    - session_approval_*
+    - active_session_*
+    - job_*
+    - runbook_custom_*
+    - dashboard_alert_state_*
+    - access_package_*
+    - announcement_*
+    - ssh_config_*
+    - complete_hosts_*
+    - offset_*
+    - projects_list
+    - schema_version
+  paths:
+    - path: /opt/auth/configs
+      required: true
+    - path: /opt/auth/keys
+      required: true
+    - path: /opt/auth/known_hosts
+      required: true
+    - path: /home/auth/.ssh
+      required: false
+    - path: /etc/isolate
+      required: false
+    - path: /etc/sudoers.d/isolate
+      required: false
+    - path: /etc/default/isolate-dashboard
+      required: false
+    - path: /etc/systemd/system/isolate-dashboard.service
+      required: false
+    - path: /etc/systemd/system/isolate-log-retention.service
+      required: false
+    - path: /etc/systemd/system/isolate-log-retention.timer
+      required: false
+    - path: /etc/systemd/system/isolate-backup.service
+      required: false
+    - path: /etc/systemd/system/isolate-backup.timer
+      required: false
+    - path: /etc/systemd/system/isolate-mcp.service
+      required: false
+    - path: /etc/systemd/system/isolate-job-worker.service
+      required: false
+    - path: /etc/systemd/system/isolate-policy-sync.service
+      required: false
+    - path: /etc/systemd/system/isolate-policy-sync.timer
+      required: false
+    - path: /etc/default/isolate-mcp
+      required: false

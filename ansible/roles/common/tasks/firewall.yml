@@ -1,0 +1,39 @@
+---
+# Task adapted for using with Centos 6 and 7
+
+- name: Stopping Firewalld...
+  service: name=firewalld state=stopped enabled=no
+  ignore_errors: yes
+  when:
+  - ansible_distribution == "CentOS"
+  - ansible_distribution_major_version == "7"
+
+- name: Installing iptables-persistent (apt)...
+  apt: name=iptables-persistent update_cache=yes state=present
+  when: ansible_distribution == "Ubuntu" or ansible_distribution == "Debian"
+
+- name: Installing iptables-services...
+  yum: name=iptables-services state=present update_cache=yes
+  when:
+  - ansible_distribution == "CentOS"
+  - ansible_distribution_major_version == "7"
+
+- name: Installing iptables rules...
+  template: src="{{ firewall_profile | default('common') }}.iptables" dest=/etc/sysconfig/iptables backup=yes
+  notify: restore iptables
+  when: ansible_distribution == "CentOS"
+
+- name: Installing iptables rules...
+  template: src="{{ firewall_profile | default('common') }}.iptables" dest=/etc/iptables/rules.v4 backup=yes
+  notify: restore iptables-persistent
+  when: ansible_distribution == "Ubuntu" or ansible_distribution == "Debian"
+
+- name: Starting iptables...
+  systemd: daemon_reload=yes name=iptables enabled=yes state=started
+  when: ansible_distribution == "CentOS"
+
+- name: Starting netfilter-persistent...
+  systemd: daemon_reload=yes name=netfilter-persistent enabled=yes state=restarted
+  when: ansible_distribution == "Ubuntu" or ansible_distribution == "Debian"
+
+- meta: flush_handlers

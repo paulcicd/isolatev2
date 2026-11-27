@@ -1,0 +1,224 @@
+umask 0077;
+USER="${USER:-NO_USER_ENV}";
+ISOLATE_DATA_ROOT="${ISOLATE_DATA_ROOT:-/opt/auth}";
+ISOLATE_SHARED="${ISOLATE_DATA_ROOT}/shared";
+ISOLATE_HELPER="${ISOLATE_SHARED}/helper.py";
+ISOLATE_CLI="${ISOLATE_SHARED}/isolate.py";
+if [ -z "${ISOLATE_PYTHON:-}" ]; then
+    if [ -x "${ISOLATE_DATA_ROOT}/.venv/bin/python3" ]; then
+        ISOLATE_PYTHON="${ISOLATE_DATA_ROOT}/.venv/bin/python3";
+    else
+        ISOLATE_PYTHON="$(command -v python3)";
+    fi
+fi
+ISOLATE_DEPLOY_LOCK="${ISOLATE_DATA_ROOT}/.deploy";
+ISOLATE_COLORS=true;
+ISOLATE_DEFAULT_PROJECT="${ISOLATE_DEFAULT_PROJECT:-main}";
+
+export USER;
+export ISOLATE_DATA_ROOT;
+export ISOLATE_SHARED;
+export ISOLATE_HELPER;
+export ISOLATE_CLI;
+export ISOLATE_PYTHON;
+export ISOLATE_COLORS;
+export ISOLATE_DEPLOY_LOCK;
+export ISOLATE_COLORS;
+export ISOLATE_DEFAULT_PROJECT;
+
+
+export LANG="en_US.UTF-8";
+export LC_COLLATE="en_US.UTF-8";
+export LC_CTYPE="en_US.UTF-8";
+export LC_MESSAGES="en_US.UTF-8";
+export LC_MONETARY="en_US.UTF-8";
+export LC_NUMERIC="en_US.UTF-8";
+export LC_TIME="en_US.UTF-8";
+export LC_ALL="en_US.UTF-8";
+
+PYTHONDONTWRITEBYTECODE=1;
+export PYTHONDONTWRITEBYTECODE;
+
+gen-oath-safe () {
+    bash --norc "${ISOLATE_DATA_ROOT}/shared/gen-oath-safe.sh" "${@}";
+}
+
+add-support-user-helper () {
+    echo "";
+    cat /opt/auth/add-support-user.sh;
+    echo "";
+}
+
+isolate-redis-cli () {
+    local redis_args=();
+    if [ -n "${ISOLATE_REDIS_HOST:-}" ]; then redis_args+=(--host "${ISOLATE_REDIS_HOST}"); fi
+    if [ -n "${ISOLATE_REDIS_PORT:-}" ]; then redis_args+=(--port "${ISOLATE_REDIS_PORT}"); fi
+    if [ -n "${ISOLATE_REDIS_DB:-}" ]; then redis_args+=(--db "${ISOLATE_REDIS_DB}"); fi
+    if [ -n "${ISOLATE_REDIS_USER:-}" ]; then redis_args+=(--user "${ISOLATE_REDIS_USER}"); fi
+    case "${ISOLATE_REDIS_SSL:-false}" in 1|true|yes|on) redis_args+=(--tls) ;; esac
+    if [ -n "${ISOLATE_REDIS_CA_CERT:-}" ]; then redis_args+=(--cacert "${ISOLATE_REDIS_CA_CERT}"); fi
+    if [ -n "${ISOLATE_REDIS_PASS:-}" ]; then
+        REDISCLI_AUTH="${ISOLATE_REDIS_PASS}" command redis-cli "${redis_args[@]}" "${@}";
+    else
+        command redis-cli "${redis_args[@]}" "${@}";
+    fi
+}
+
+redis-dev () {
+    isolate-redis-cli "${@}";
+}
+
+isolate () {
+    "${ISOLATE_PYTHON}" "${ISOLATE_CLI}" "${@}";
+}
+
+isolate-complete () {
+    "${ISOLATE_PYTHON}" "${ISOLATE_HELPER%/*}/isolate_client.py" complete "${@}";
+}
+
+deploy_lock () {
+    while [ ! -d "${ISOLATE_DATA_ROOT}" ]; do
+        echo "ISOLATE Git root not found: ${ISOLATE_DATA_ROOT} awaiting deploy...";
+        sleep 1;
+    done
+
+    while [ -f "${ISOLATE_DEPLOY_LOCK}" ]; do
+        echo "Lock found: ${ISOLATE_DEPLOY_LOCK} awaiting deploy end...";
+        sleep 1;
+    done
+}
+
+auth_callback_cleanup () {
+    # cat "${ISOLATE_SESSION}" 2>/dev/null;
+    rm -f "${ISOLATE_SESSION}" > /dev/null 2>&1 || /bin/true;
+    case "${ISOLATE_AUTHORIZATION_FILE:-}" in
+        /tmp/isolate-authorization-*) rm -f -- "${ISOLATE_AUTHORIZATION_FILE}" ;; 
+    esac
+    unset ISOLATE_AUTHORIZATION_FILE;
+}
+
+auth_callback () {
+    if [[ $# -eq 0 ]] ; then
+        return
+    fi
+    unset ISOLATE_CALLBACK ISOLATE_CALLBACK_CMD ISOLATE_AUTHORIZATION_FILE;
+    SESS_DIR="${HOME}/.auth_sess";
+    if [[ ! -d "${SESS_DIR}" ]] ; then
+        mkdir -p "${SESS_DIR}";
+    fi
+
+    ISOLATE_SESSION=$(mktemp "${SESS_DIR}/ssh_XXXXXXXXX");
+    export ISOLATE_SESSION;
+    trap auth_callback_cleanup SIGHUP SIGINT SIGTERM EXIT;
+
+    "${@}";
+
+    source "${ISOLATE_SESSION}" > /dev/null 2>&1;
+    rm -f -- "${ISOLATE_SESSION}";
+
+    if [ "${ISOLATE_CALLBACK}" == "${ISOLATE_SESSION}" ]; then
+        if [ -n "${ISOLATE_CALLBACK_CMD+x}" ]; then
+            "${ISOLATE_CALLBACK_CMD[@]}";
+            local connection_status=$?;
+            auth_callback_cleanup;
+            return "${connection_status}";
+        else
+            /bin/false;
+        fi
+    fi
+    auth_callback_cleanup;
+}
+
+g () {
+    if [[ $# -eq 0 ]] ; then
+        echo -e "\\n  Usage: g <project|host> [server_name] [ --user | --port | --nosudo | --debug ] \\n";
+        return
+    elif [[ $# -gt 0 ]] ; then
+        deploy_lock
+        auth_callback "${ISOLATE_PYTHON}" "${ISOLATE_HELPER}" go "${@}";
+    fi
+}
+
+s () {
+    if [[ $# -eq 0 ]] ; then
+        echo -e "\\n  Usage: s <query> \\n";
+        return
+    elif [[ $# -gt 0 ]] ; then
+        deploy_lock
+        "${ISOLATE_PYTHON}" "${ISOLATE_HELPER}" search "${@}";
+    fi
+}
+
+p () {
+    deploy_lock
+    "${ISOLATE_PYTHON}" "${ISOLATE_HELPER}" projects;
+}
+
+f () {
+    deploy_lock
+    "${ISOLATE_PYTHON}" "${ISOLATE_CLI}" history "${@}";
+}
+
+auth-add-user () {
+    if [[ $# -eq 0 ]] ; then
+        echo -e "\\n  Usage: auth-add-user <username> \\n";
+        return
+    elif [[ $# -gt 0 ]] ; then
+        useradd "${1}" -m --groups auth -s /bin/bash;
+        passwd "${1}";
+    fi
+}
+
+auth-add-host () {
+    if [[ $# -eq 0 ]] ; then
+        echo -e "\\n  Usage: auth-add-host --project <project_name> --server-name <server_name> --ip 192.0.2.73 --port 22 --user root --nosudo --services 'nginx, redis' --note 'VIP frontend' --vip --privileged-provider Warpgate --privileged-url https://bastion.example.org \\n";
+        return
+    elif [[ $# -gt 0 ]] ; then
+        "${ISOLATE_PYTHON}" "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "add-host" "${@}";
+    fi
+}
+
+auth-dump-host () {
+    if [[ $# -eq 0 ]] ; then
+        echo -e "\\n  Usage: auth-dump-host <server_id>\\n";
+        return
+    elif [[ $# -gt 0 ]] ; then
+        "${ISOLATE_PYTHON}" "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "dump-host" --server-id "${@}";
+    fi
+}
+
+auth-del-host () {
+    if [[ $# -eq 0 ]] ; then
+        echo -e "\\n  Usage: auth-del-host <server_id>\\n";
+        return
+    elif [[ $# -gt 0 ]] ; then
+        "${ISOLATE_PYTHON}" "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "del-host" --server-id "${@}";
+    fi
+}
+
+auth-add-project-config () {
+    if [[ $# -eq 0 ]] ; then
+        echo -e "\\n  Usage: auth-add-project-config <project_name> --port 3222 --user root3 --nosudo \\n";
+        return
+    elif [[ $# -gt 0 ]] ; then
+        "${ISOLATE_PYTHON}" "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "add-project-config" --project "${@}";
+    fi
+}
+
+auth-del-project-config () {
+    if [[ $# -eq 0 ]] ; then
+        echo -e "\\n  Usage: auth-del-project-config <project_name>\\n";
+        return
+    elif [[ $# -gt 0 ]] ; then
+        "${ISOLATE_PYTHON}" "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "del-project-config" --project "${@}";
+    fi
+}
+
+auth-dump-project-config () {
+    if [[ $# -eq 0 ]] ; then
+        echo -e "\\n  Usage: auth-dump-project-config <project_name>\\n";
+        return
+    elif [[ $# -gt 0 ]] ; then
+        "${ISOLATE_PYTHON}" "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "dump-project-config" --project "${@}";
+    fi
+}

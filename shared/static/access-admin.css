@@ -1,0 +1,65 @@
+.access-admin .table-wrap small { display: block; }
+.access-admin .admin-selected td { background: var(--accent-soft); }
+.access-admin .admin-panel > .key-value { margin: 14px 0; }
+.access-admin .access-export { position: relative; margin: 0; padding: 0; border: 0; }
+.access-admin .access-export > .admin-panel {
+  display: flex;
+  gap: 6px;
+  position: absolute;
+  inset-inline-end: 0;
+  z-index: 3;
+  margin-top: 4px;
+  padding: 7px;
+}
+.access-admin .access-form,
+.access-admin [data-package-form] {
+  margin: 8px 0 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.access-admin .access-form .access-check,
+.access-admin [data-package-form] .access-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-weight: 500;
+}
+.access-admin .access-submit { margin-top: 10px; }
+.access-admin .access-package-editor h3 { margin: 16px 0 7px; }
+.access-admin .access-package-rules { grid-template-columns: minmax(0, 1fr); }
+.access-admin [data-package-rule-list] { display: grid; gap: 8px; margin-top: 8px; }
+.access-admin [data-package-rule-list] fieldset { min-width: 0; }
+.access-admin [data-package-rule-list] fieldset > button { margin-top: 8px; }
+.access-admin .access-package-json textarea { width: 100%; }
+.access-admin .access-package-editor [hidden] { display: none; }
+.access-admin .access-summary { margin: 12px 0; }
+.access-admin td .access-form { min-width: 205px; }
+.access-admin .matrix-filters {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) max-content;
+  align-items: end;
+  gap: 10px 14px;
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.access-admin .matrix-filters-findings { grid-template-columns: minmax(0, 320px) max-content; }
+.matrix-filters label { display: grid; min-width: 0; gap: 5px; }
+.matrix-filters .field-help-admin-slot { display: block; position: relative; }
+.matrix-filters .field-help-admin-slot > label > span:first-child { padding-inline-end: 30px; }
+.matrix-filters .field-help-admin-slot > .field-help-trigger {
+  position: absolute; inset-block-start: -3px; inset-inline-end: 0; margin: 0;
+}
+.matrix-filters :is(input[type="search"], select, button[type="submit"]) { min-height: 38px; margin: 0; }
+.matrix-filters :is(input[type="search"], select) { width: 100%; min-width: 0; }
+.matrix-results > .table-wrap { margin-top: 0; }
+@media (max-width: 680px) {
+  .access-admin .matrix-filters { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 600px) {
+  .access-admin .access-export > .admin-panel { inset-inline-start: 0; inset-inline-end: auto; }
+}

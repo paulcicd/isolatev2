@@ -1,0 +1,79 @@
+:root {
+  color-scheme: light dark;
+  --bg: light-dark(#f6f7f9, #0d0e10);
+  --surface: light-dark(#fff, #121316);
+  --ink: light-dark(#202631, #e7e8ea);
+  --muted: light-dark(#505b6d, #a1a4ab);
+  --border: light-dark(#dde1e8, #24262b);
+  --accent: light-dark(#285bbb, #7aa7ff);
+  --accent-ink: light-dark(#fff, #0e1929);
+  --accent-soft: light-dark(#eaf0fd, #1a2436);
+  --amber: light-dark(#855507, #e2ab4a);
+  --red: light-dark(#b52b35, #f07575);
+  --mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+}
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-theme="light"] { color-scheme: light; }
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  font: 15px/1.5 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+}
+.error-brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 15px clamp(16px, 4vw, 42px);
+  border-bottom: 1px solid var(--border);
+  font-size: 20px;
+  letter-spacing: -.045em;
+}
+.error-brand svg {
+  box-sizing: content-box;
+  padding: 7px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.error-brand span, .error-detail, .error-reference span { color: var(--muted); }
+main { display: grid; place-items: center; padding: 24px 16px; }
+section {
+  --status: var(--amber);
+  width: min(100%, 600px);
+  padding: clamp(22px, 5vw, 46px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-top: 2px solid var(--status);
+  border-radius: 12px;
+}
+section[data-status="500"] { --status: var(--red); }
+.error-status { display: flex; align-items: center; gap: 10px; margin: 0; color: var(--status); }
+code { font: .875rem/1.5 var(--mono); overflow-wrap: anywhere; }
+h1 { margin: 19px 0 10px; font-size: clamp(1.65rem, 4.5vw, 2.3rem); line-height: 1.13; letter-spacing: -.04em; }
+.error-detail { max-width: 52ch; margin: 0 0 23px; }
+.error-action {
+  display: inline-block;
+  padding: 9px 13px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  text-decoration: none;
+  font-weight: 650;
+}
+.error-action:hover { filter: brightness(1.08); }
+.error-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.error-reference {
+  display: grid;
+  gap: 3px;
+  margin-top: 24px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}

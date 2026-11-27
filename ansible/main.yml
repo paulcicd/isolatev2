@@ -1,0 +1,46 @@
+---
+- name: Validate the source for the legacy Ansible deployment
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Require an explicit repository and full commit SHA
+      ansible.builtin.assert:
+        that:
+          - git_repo is defined
+          - git_repo is string
+          - git_repo | trim | length > 0
+          - git_branch is defined
+          - git_branch is string
+          - git_branch is match('^[0-9a-f]{40}$')
+        fail_msg: Set git_repo and git_branch to the source repository and its full commit SHA.
+      tags: deploy
+
+- name: Ubuntu 16.04 workarounds
+  gather_facts: no
+  connection: local
+  hosts: all
+  tasks:
+  - name: Installing Python...
+    shell: "ssh -o StrictHostKeyChecking=accept-new -l root {{ ansible_ssh_host }} 'apt-get clean ; apt-get update ; apt-get -y install python3 python3-dev python3-pip python3-venv'"
+    when: ubuntu_1604 | default(False)
+    tags: always
+
+- name: Auth host setup...
+  gather_facts: yes
+  become_user: root
+  hosts: all
+  roles:
+    - role: common
+      tags: common
+
+    - role: redis
+      tags: redis
+
+    - role: pam2fa
+      tags: pam2fa
+
+    - role: auth
+      tags: auth
+
+    - role: deploy
+      tags: deploy

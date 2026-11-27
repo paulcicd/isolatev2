@@ -1,0 +1,102 @@
+name: Build verified Linux release
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version without the v prefix
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+  package:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Audit the locked dependencies and create the SBOM
+        run: |
+          python -m venv "$RUNNER_TEMP/isolate-audit"
+          audit_python="$RUNNER_TEMP/isolate-audit/bin/python"
+          "$audit_python" -m pip install pip-audit
+          "$audit_python" -m pip_audit --strict --no-deps --require-hashes --disable-pip -r requirements-linux-py312.lock \
+            --format cyclonedx-json --output "$RUNNER_TEMP/dependency-sbom.json"
+      - name: Bundle the exact candidate and checksums
+        env:
+          MANUAL_VERSION: ${{ inputs.version }}
+        run: |
+          version="$MANUAL_VERSION"
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          python scripts/isolate-build-release.py --ref "$GITHUB_SHA" --version "$version" --output dist \
+            --sbom "$RUNNER_TEMP/dependency-sbom.json"
+      - name: Rehearse installation, update and rollback from the artifact
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y redis-server openssl
+          wheels="$RUNNER_TEMP/isolate-wheels"
+          python -m pip download --require-hashes --only-binary=:all: -r requirements-linux-py312.lock -d "$wheels"
+          export PIP_NO_INDEX=1 PIP_FIND_LINKS="$wheels"
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-linux-py312.lock
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+          version="$(jq -er .version dist/release.json)"
+          candidate="$RUNNER_TEMP/isolate-$version"
+          tar -xzf "dist/isolate-$version.tar.gz" -C "$RUNNER_TEMP"
+          cp dist/release.json "$candidate/release.json"
+          python tests/integration/release/release_integration.py --source "$candidate"
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            dist/isolate-*.tar.gz
+            dist/release.json
+            dist/dependency-sbom.json
+            dist/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: isolate-linux-release
+          path: dist/
+          if-no-files-found: error
+  publish:
+    if: github.event_name == 'push'
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: isolate-linux-release
+          path: dist
+      - name: Publish verified assets for the existing tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+          version="$(jq -er '.version' dist/release.json)"
+          revision="$(jq -er '.revision' dist/release.json)"
+          [[ "v$version" == "$GITHUB_REF_NAME" ]]
+          [[ "$revision" == "$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)" ]]
+          flags=()
+          if [[ "$version" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" "dist/isolate-$version.tar.gz" dist/release.json \
+            dist/SHA256SUMS dist/dependency-sbom.json --verify-tag --repo "$GITHUB_REPOSITORY" \
+            --title "Isolate $version" --notes 'Linux/systemd release. Verify SHA256SUMS and the GitHub build provenance before installing.' \
+            "${flags[@]}"

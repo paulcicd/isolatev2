@@ -1,0 +1,44 @@
+---
+- name: Verify pinned SSH login as the bastion service account
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - /dev/null
+      - -nT
+      - -o
+      - BatchMode=yes
+      - -o
+      - PreferredAuthentications=publickey
+      - -o
+      - ConnectTimeout=8
+      - -o
+      - IdentitiesOnly=yes
+      - -o
+      - IdentityAgent=none
+      - -o
+      - ForwardAgent=no
+      - -o
+      - ClearAllForwardings=yes
+      - -o
+      - StrictHostKeyChecking=yes
+      - -o
+      - HostKeyAlgorithms=ssh-ed25519
+      - -o
+      - GlobalKnownHostsFile=/dev/null
+      - -o
+      - "UserKnownHostsFile={{ item }}"
+      - -i
+      - "{{ isolate_enrollment_bastion_identity_file }}"
+      - -p
+      - "{{ _isolate_probe_target.server_port | string }}"
+      - -l
+      - "{{ _isolate_probe_target.server_user }}"
+      - --
+      - "{{ _isolate_probe_target.server_ip }}"
+      - 'true'
+  loop: "{{ isolate_enrollment_known_hosts_files | unique | list }}"
+  delegate_to: "{{ isolate_enrollment_bastion }}"
+  become: true
+  become_user: "{{ isolate_enrollment_bastion_user }}"
+  changed_when: false

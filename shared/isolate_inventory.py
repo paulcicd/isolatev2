@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Inventory helpers for Redis-backed Isolate hosts."""
+
+import json
+import hashlib
+import re
+import time
+
+from IsolateCore import is_valid_fqdn, is_valid_ipv4_address, is_valid_ipv6_address
+from isolate_service_discovery import get_discovery, service_display
+
+
+class HostValidationError(Exception):
+    pass
+
+
+def decode(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def normalize_services(value):
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(item).strip() for item in value if str(item).strip())
+    return str(value).strip()
+
+
+def normalize_tags(value):
+    """Return validated, deterministic tags from a mapping or key=value selectors.
+
+    Text forms accept comma/newline-separated pairs. An empty value clears tags;
+    duplicate keys with conflicting values are rejected rather than silently
+    changing the selected fleet.
+    """
+    if value is None or value == "":
+        return {}
+    if isinstance(value, dict):
+        pairs = list(value.items())
+    else:
+        if isinstance(value, str):
+            value = [item.strip() for item in re.split(r"[,\r\n]+", value) if item.strip()]
+        if not isinstance(value, (list, tuple, set)):
+            raise HostValidationError("tags must be a mapping or key=value pairs")
+        pairs = []
+        for item in value:
+            if not isinstance(item, str) or "=" not in item:
+                raise HostValidationError("each tag must use key=value")
+            pairs.append(item.split("=", 1))
+    if len(pairs) > 64:
+        raise HostValidationError("at most 64 tags are allowed")
+    normalized = {}
+    for key, tag_value in pairs:
+        if not isinstance(key, str) or not isinstance(tag_value, str):
+            raise HostValidationError("tag keys and values must be strings")
+        key, tag_value = key.strip(), tag_value.strip()
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}", key) is None:
+            raise HostValidationError("tag keys must contain 1-64 letters, digits, or ._:/-")
+        if not tag_value or len(tag_value) > 256 or "," in tag_value or any(ord(char) < 32 or ord(char) == 127 for char in tag_value):
+            raise HostValidationError("tag values must contain 1-256 printable characters without commas")
+        if key in normalized and normalized[key] != tag_value:
+            raise HostValidationError("conflicting values for tag {}".format(key))
+        normalized[key] = tag_value
+    return dict(sorted(normalized.items()))
+
+
+def host_matches_tags(host, tags):
+    selectors = normalize_tags(tags)
+    host_tags = normalize_tags((host or {}).get("tags"))
+    return all(host_tags.get(key) == value for key, value in selectors.items())
+
+
+def _resource_metadata(value, field, maximum):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise HostValidationError("{} must be a string".format(field))
+    value = value.strip()
+    if len(value) > maximum or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise HostValidationError("{} must contain at most {} printable characters".format(field, maximum))
+    return value
+
+
+def normalize_host(host):
+    row = dict(host)
+    row["server_id"] = str(row.get("server_id") or "")
+    row["project_name"] = str(row.get("project_name") or "")
+    row["server_name"] = str(row.get("server_name") or "")
+    row["server_ip"] = str(row.get("server_ip") or "")
+    row["server_services"] = normalize_services(row.get("server_services"))
+    row["server_note"] = str(row.get("server_note") or "").strip()
+    row["tags"] = normalize_tags(row.get("tags"))
+    row["tags_display"] = ", ".join("{}={}".format(key, value) for key, value in row["tags"].items())
+    row["resource_owner"] = _resource_metadata(row.get("resource_owner"), "resource owner", 128) or row["tags"].get("owner", "")
+    row["environment"] = _resource_metadata(row.get("environment"), "environment", 64) or row["tags"].get("env", "")
+    row["server_vip"] = bool(row.get("server_vip"))
+    row["server_vip_marker"] = "VIP" if row["server_vip"] else ""
+    row["privileged_access_provider"] = str(row.get("privileged_access_provider") or "").strip()
+    row["privileged_access_url"] = str(row.get("privileged_access_url") or "").strip()
+    row["privileged_access_hint"] = str(row.get("privileged_access_hint") or "").strip()
+    row["maintenance_enabled"] = bool(row.get("maintenance_enabled"))
+    row["maintenance_until"] = int(row.get("maintenance_until") or 0) or None
+    row["maintenance_reason"] = str(row.get("maintenance_reason") or "").strip()
+    row["maintenance_active"] = is_host_in_maintenance(row)
+    row["maintenance_marker"] = "MAINT" if row["maintenance_active"] else ""
+    return row
+
+
+def is_host_in_maintenance(host, now=None):
+    if not bool((host or {}).get("maintenance_enabled")):
+        return False
+    until = int((host or {}).get("maintenance_until") or 0)
+    return not until or until > int(now if now is not None else time.time())
+
+
+def host_revision(host):
+    payload = dict(host or {})
+    payload.pop("_revision", None)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def list_hosts(redis, project=None, query=None, tags=None):
+    selectors = normalize_tags(tags)
+    rows = []
+    for key in redis.keys("server_*"):
+        if re.match(r"^server_[0-9]+$", decode(key)) is None:
+            continue
+        raw = redis.get(key)
+        if raw is None:
+            continue
+        host = normalize_host(json.loads(decode(raw)))
+        host["_revision"] = host_revision(host)
+        host["service_discovery"] = get_discovery(redis, host["server_id"])
+        host["server_services_display"] = service_display(host, host["service_discovery"])
+        if project and host.get("project_name") != project:
+            continue
+        if query and not host_matches_query(host, query):
+            continue
+        if selectors and not host_matches_tags(host, selectors):
+            continue
+        rows.append(host)
+    return sorted(rows, key=lambda row: (row.get("project_name") or "", row.get("server_name") or "", row.get("server_id") or ""))
+
+
+def get_host(redis, server_id):
+    raw = redis.get("server_{}".format(server_id))
+    if raw is None:
+        return None
+    host = normalize_host(json.loads(decode(raw)))
+    host["_revision"] = host_revision(host)
+    host["service_discovery"] = get_discovery(redis, host["server_id"])
+    host["server_services_display"] = service_display(host, host["service_discovery"])
+    return host
+
+
+def host_matches_query(host, query):
+    query_l = str(query or "").lower()
+    if not query_l:
+        return True
+    fields = (
+        "project_name",
+        "server_name",
+        "server_id",
+        "server_ip",
+        "server_user",
+        "server_services",
+        "server_services_display",
+        "server_note",
+        "tags_display",
+        "resource_owner",
+        "environment",
+        "server_vip_marker",
+        "privileged_access_provider",
+        "privileged_access_url",
+        "privileged_access_hint",
+        "maintenance_marker",
+        "maintenance_reason",
+    )
+    return any(query_l in str(host.get(field) or "").lower() for field in fields)
+
+
+def validate_host_updates(redis, updates):
+    normalized = {}
+    for field, maximum in (("resource_owner", 128), ("environment", 64)):
+        if field in updates:
+            normalized[field] = _resource_metadata(updates[field], field, maximum)
+    if updates.get("tags") is not None:
+        normalized["tags"] = normalize_tags(updates["tags"])
+    if updates.get("project_name") is not None:
+        project = str(updates["project_name"]).strip().lower()
+        if re.match(r"^[A-Za-z,\d\-]*$", project) is None or len(project) > 48:
+            raise HostValidationError("project validation failed")
+        normalized["project_name"] = project
+    if updates.get("server_name") is not None:
+        name = str(updates["server_name"]).strip().lower()
+        if not is_valid_fqdn(name):
+            raise HostValidationError("server name validation failed")
+        normalized["server_name"] = name
+    if updates.get("server_ip") is not None:
+        ip = str(updates["server_ip"]).strip()
+        if not is_valid_ipv4_address(ip) and not is_valid_ipv6_address(ip):
+            raise HostValidationError("server ip validation failed")
+        normalized["server_ip"] = ip
+    if updates.get("server_port") is not None:
+        port = int(updates["server_port"])
+        if port > 65535 or port <= 0:
+            raise HostValidationError("port validation failed")
+        normalized["server_port"] = port
+    if updates.get("server_user") is not None:
+        user = str(updates["server_user"]).strip()
+        if re.match(r"^[A-Za-z,\d\-]*$", user) is None or len(user) > 48:
+            raise HostValidationError("user validation failed")
+        normalized["server_user"] = user
+    if updates.get("server_nosudo") is not None:
+        normalized["server_nosudo"] = bool(updates["server_nosudo"])
+    if updates.get("server_vip") is not None:
+        normalized["server_vip"] = bool(updates["server_vip"])
+    if updates.get("server_services") is not None:
+        services = normalize_services(updates["server_services"])
+        if len(services) > 2048:
+            raise HostValidationError("services value is too long")
+        normalized["server_services"] = services
+    if updates.get("server_note") is not None:
+        note = str(updates["server_note"]).strip()
+        if len(note) > 2048:
+            raise HostValidationError("note value is too long")
+        normalized["server_note"] = note
+    if updates.get("maintenance_enabled") is not None:
+        normalized["maintenance_enabled"] = bool(updates["maintenance_enabled"])
+    if updates.get("maintenance_until") is not None:
+        until = int(updates["maintenance_until"] or 0)
+        if until < 0:
+            raise HostValidationError("maintenance until must be a Unix timestamp or zero")
+        normalized["maintenance_until"] = until or None
+    if updates.get("maintenance_reason") is not None:
+        reason = str(updates["maintenance_reason"] or "").strip()
+        if len(reason) > 1024:
+            raise HostValidationError("maintenance reason is too long")
+        normalized["maintenance_reason"] = reason
+    for source, target in (
+        ("privileged_access_provider", "privileged_access_provider"),
+        ("privileged_access_url", "privileged_access_url"),
+        ("privileged_access_hint", "privileged_access_hint"),
+    ):
+        if updates.get(source) is not None:
+            value = str(updates[source]).strip()
+            if len(value) > 2048:
+                raise HostValidationError("{} value is too long".format(target))
+            normalized[target] = value
+    if updates.get("proxy_id") is not None:
+        proxy_id = str(updates["proxy_id"]).strip()
+        if proxy_id and redis.get("server_{}".format(proxy_id)) is None:
+            raise HostValidationError("proxy with id {} not found".format(proxy_id))
+        normalized["proxy_id"] = proxy_id or None
+    return normalized
+
+
+def _mutate_hosts(redis, server_ids, mutation):
+    """Recheck object scopes and revisions against the records being committed."""
+    keys = ["server_{}".format(server_id) for server_id in server_ids]
+
+    def apply(reader, writer=None):
+        current = [(server_id, _read_host_record(reader, key)) for server_id, key in zip(server_ids, keys)]
+        records = mutation(current)
+        if writer is not None and callable(getattr(writer, "multi", None)):
+            writer.multi()
+        target = writer if writer is not None else redis
+        for server_id, host in records:
+            target.set("server_{}".format(server_id), json.dumps(host, sort_keys=True))
+        if writer is not None:
+            writer.execute()
+        return records
+
+    if not callable(getattr(redis, "pipeline", None)):
+        return apply(redis)
+    pipeline = redis.pipeline(transaction=True)
+    if not callable(getattr(pipeline, "watch", None)):
+        return apply(redis, pipeline)
+    from redis.exceptions import WatchError
+    for _ in range(5):
+        with redis.pipeline(transaction=True) as pipeline:
+            try:
+                pipeline.watch(*keys)
+                return apply(pipeline, pipeline)
+            except WatchError:
+                continue
+    raise HostValidationError("host changed concurrently; reload before saving")
+
+
+def _read_host_record(redis, key):
+    raw = redis.get(key)
+    return json.loads(decode(raw)) if raw is not None else None
+
+
+def update_host(redis, server_id, updates, updated_by=None, expected_revision=None, authorize=None):
+    def update(current):
+        server_id, host = current[0]
+        if host is None:
+            return []
+        before = normalize_host(host)
+        if expected_revision and host_revision(before) != str(expected_revision):
+            raise HostValidationError("host changed since this form was opened; reload before saving")
+        proposed = dict(host, **validate_host_updates(redis, updates))
+        if authorize is not None:
+            authorize(before, normalize_host(proposed))
+        proposed["updated_by"] = updated_by or "unknown"
+        proposed["updated_at"] = int(time.time())
+        return [(server_id, proposed)]
+
+    records = _mutate_hosts(redis, [str(server_id)], update)
+    if not records:
+        return None
+    normalized = normalize_host(records[0][1])
+    normalized["_revision"] = host_revision(normalized)
+    return normalized
+
+
+def bulk_update_hosts(redis, server_ids, updates, updated_by=None, authorize=None):
+    ids = [str(server_id) for server_id in server_ids]
+    if not ids:
+        raise HostValidationError("at least one host id is required")
+    if len(ids) != len(set(ids)):
+        raise HostValidationError("duplicate host ids are not allowed")
+    normalized_updates = validate_host_updates(redis, updates)
+    if not normalized_updates:
+        raise HostValidationError("at least one update field is required")
+    def update(current):
+        updated_at = int(time.time())
+        records = []
+        for server_id, host in current:
+            if host is None:
+                raise HostValidationError("host not found: {}".format(server_id))
+            proposed = dict(host, **normalized_updates)
+            if authorize is not None:
+                authorize(normalize_host(host), normalize_host(proposed))
+            proposed["updated_by"] = updated_by or "unknown"
+            proposed["updated_at"] = updated_at
+            records.append((server_id, proposed))
+        return records
+    records = _mutate_hosts(redis, ids, update)
+    return [normalize_host(host) for _, host in records]
+
+
+def create_host(redis, values, updated_by=None):
+    required = ("project_name", "server_name", "server_ip", "server_user")
+    missing = [name for name in required if values.get(name) in (None, "")]
+    if missing:
+        raise HostValidationError("missing required host fields: {}".format(", ".join(missing)))
+    candidate = dict(values)
+    candidate.setdefault("server_port", 22)
+    normalized = validate_host_updates(redis, candidate)
+    redis.set("offset_server_id", 10000, nx=True)
+    server_id = redis.incr("offset_server_id")
+    host = {
+        "server_id": int(server_id),
+        "project_name": normalized.get("project_name"),
+        "server_name": normalized.get("server_name"),
+        "server_ip": normalized.get("server_ip"),
+        "server_port": normalized.get("server_port", 22),
+        "server_user": normalized.get("server_user"),
+        "server_nosudo": normalized.get("server_nosudo"),
+        "server_services": normalized.get("server_services", ""),
+        "server_note": normalized.get("server_note", ""),
+        "tags": normalized.get("tags", {}),
+        "resource_owner": normalized.get("resource_owner", ""),
+        "environment": normalized.get("environment", ""),
+        "server_vip": normalized.get("server_vip", False),
+        "privileged_access_provider": normalized.get("privileged_access_provider", ""),
+        "privileged_access_url": normalized.get("privileged_access_url", ""),
+        "privileged_access_hint": normalized.get("privileged_access_hint", ""),
+        "maintenance_enabled": normalized.get("maintenance_enabled", False),
+        "maintenance_until": normalized.get("maintenance_until"),
+        "maintenance_reason": normalized.get("maintenance_reason", ""),
+        "proxy_id": normalized.get("proxy_id"),
+        "geoip_asn": None,
+        "updated_by": updated_by or "unknown",
+        "updated_at": int(time.time()),
+    }
+    redis.set("server_{}".format(server_id), json.dumps(host, sort_keys=True))
+    result = normalize_host(host)
+    result["_revision"] = host_revision(result)
+    return result
+
+
+def format_hosts_table(rows):
+    columns = [
+        ("server_id", "id", 6),
+        ("project_name", "project", 16),
+        ("server_ip", "ip", 16),
+        ("server_name", "name", 20),
+        ("server_vip_marker", "vip", 4),
+        ("maintenance_marker", "state", 6),
+        ("server_user", "user", 12),
+        ("server_services_display", "services", 32),
+        ("tags_display", "tags", 24),
+    ]
+    lines = ["  ".join(label.ljust(width) for _, label, width in columns)]
+    for row in rows:
+        lines.append("  ".join(str(row.get(key) or (row.get("server_services") if key == "server_services_display" else "") or "").ljust(width) for key, _, width in columns))
+    return "\n".join(lines)

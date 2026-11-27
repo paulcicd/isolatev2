@@ -1,0 +1,1066 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from time import time
+import argparse
+import json
+import sys
+import os
+import logging
+import operator
+from copy import copy
+from uuid import uuid4
+import socket
+import re
+import shlex
+from operator import itemgetter
+from pyzabbix import ZabbixAPI
+# from IsolateCore import __version__
+from isolate_config import load_config
+from isolate_identity import IdentityError, load_verified_identity, local_identity
+from isolate_logging import SessionLogger
+from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant
+from isolate_announcements import list_announcements
+from isolate_inventory import is_host_in_maintenance
+from isolate_service_discovery import get_discovery, service_display
+from isolate_connection_auth import prepare_authorization_file
+from isolate_ssh import SSHArgumentError, filter_extra_args
+
+
+LOG_FORMAT = '[%(levelname)s] %(name)s %(message)s'
+
+
+LOGGER = logging.getLogger('helper')
+pyzabbix_LOGGER = logging.getLogger('pyzabbix')
+pyzabbix_LOGGER.setLevel(logging.WARN)
+pyzabbix_requests_LOGGER = logging.getLogger('requests.packages.urllib3.connectionpool')
+pyzabbix_requests_LOGGER.setLevel(logging.WARN)
+
+
+def merge_dicts(*dict_args):
+    """
+    Given any number of dicts, shallow copy and merge into a new dict,
+    precedence goes to key value pairs in latter dicts.
+    """
+    result = {}
+    for dictionary in dict_args:
+        if dictionary is None:
+            continue
+        else:
+            for key in list(dictionary.keys()):
+                if dictionary[key] is None:
+                    del dictionary[key]
+        result.update(dictionary)
+    return result
+
+
+def str2bool(s):
+    yes_bools = ['true', 'yes', 'da', 'aga', 'ok', 'yep', 'да', 'ага', 'kk', 'y', 'конечно', 'да, товарищ']
+
+    if str(s).lower() in yes_bools:
+        return True
+    else:
+        return False
+
+
+def init_args():
+
+    arg_parser = argparse.ArgumentParser(prog='helper', epilog='------',
+                                         description='Auth shell helper')
+    arg_parser.add_argument('action', type=str, nargs=1, choices=['search', 'go', 'cron', 'projects'])
+    arg_parser.add_argument('sargs', type=str, nargs='*',
+                            help='[search server_id | go project | go project server_name]')
+    arg_parser.add_argument('--helper-debug', action='store_true')
+    arg_parser.add_argument_group('Search', 's <query> [opts]')
+    arg_parser.add_argument_group('Go', 'g <project|host> [server_name|server_ip] [opts]')
+    arg_parser.add_argument_group('Projects', 'p [opts]')
+
+    # Unknown args bypassed to ssh.py wrapper
+    args, unknown_args = arg_parser.parse_known_args()
+
+    if args.helper_debug or '--debug' in sys.argv:
+        args.helper_debug = True
+
+        logging.basicConfig(stream=sys.stdout, level=logging.DEBUG,
+                            format=LOG_FORMAT, datefmt='%Y-%m-%d %H:%M:%S')
+        LOGGER.info('Helper debug mode on')
+        LOGGER.info(sys.argv)
+        LOGGER.info(vars(args))
+        LOGGER.info(unknown_args)
+
+    else:
+        logging.basicConfig(stream=sys.stderr, level=logging.WARN, format=LOG_FORMAT, datefmt='%Y-%m-%d %H:%M:%S')
+
+    return args, unknown_args
+
+
+class IsolateZabbixHosts(object):
+    def __init__(self):
+        self.hosts_dump = list()
+        self.hosts_dict = dict()
+        self.projects = list()
+        self.zapi = ZabbixAPI(os.getenv('ISOLATE_ZABBIX_URL'))
+        self.zapi.login(os.getenv('ISOLATE_ZABBIX_USER'), os.getenv('ISOLATE_ZABBIX_PASS'))
+
+    def get_hosts(self):
+        for h in self.zapi.hostinterface.get(output="extend", selectHosts=["host"], filter={"main": 1, "type": 1}):
+            host = dict(
+                server_name=h['hosts'][0]['host'],
+                server_id=h['hosts'][0]['hostid'],
+                server_ip=h['ip']
+            )
+            self.hosts_dict[str(host['server_id'])] = host
+
+        for g in self.zapi.hostgroup.get(output="extend", selectHosts=["host"], filter={"main": 1, "type": 1}):
+            project_name = g['name']
+            self.projects.append(project_name)
+            for h in g['hosts']:
+                server_id = h['hostid']
+                host = self.hosts_dict[server_id]
+                host['project_name'] = project_name
+                self.hosts_dump.append(self.hosts_dict[server_id])
+        return self.hosts_dump
+
+    def get_projects(self):
+        return list(sorted(set(self.projects)))
+
+    def put_projects_list(self):
+        raise Exception('Not implemented')
+
+    def put_hosts_per_project_list(self, key, value):
+        pass
+
+
+class IsolateRedisHosts(object):
+    def __init__(self, config=None):
+        self.projects = list()
+        self.hosts_dump = list()
+        if config is None:
+            config = load_config()
+        from isolate_redis import create_redis_client
+        self.redis = create_redis_client(config)
+
+    def get_hosts(self):
+        for server_key in self.redis.keys('server_*'):
+            server_data = self.redis.get(server_key)
+            if isinstance(server_data, bytes):
+                server_data = server_data.decode('utf-8')
+            server_data = json.loads(server_data)
+            server_data['server_services_display'] = service_display(server_data, get_discovery(self.redis, server_data.get('server_id')))
+            self.projects.append(server_data['project_name'])
+            self.hosts_dump.append(server_data)
+        return self.hosts_dump
+
+    def get_projects(self):
+        return list(sorted(set(self.projects)))
+
+    def get_project_config(self, project):
+        redis_key = 'ssh_config_{0}'.format(project)
+        res = self.redis.get(redis_key)
+        if res is not None:
+            if isinstance(res, bytes):
+                res = res.decode('utf-8')
+            return json.loads(res)
+        else:
+            return None
+
+    def get_server_config(self, server_id):
+        redis_key = 'server_{0}'.format(server_id)
+        LOGGER.debug('IsolateRedisHosts: get_server_config')
+        LOGGER.debug(redis_key)
+        res = self.redis.get(redis_key)
+        if res is not None:
+            if isinstance(res, bytes):
+                res = res.decode('utf-8')
+            return json.loads(res)
+        else:
+            return None
+
+    def get_policy_rules(self):
+        rules = []
+        for policy_key in self.redis.keys('policy_*'):
+            policy_data = self.redis.get(policy_key)
+            if isinstance(policy_data, bytes):
+                policy_data = policy_data.decode('utf-8')
+            rules.append(json.loads(policy_data))
+        return rules
+
+    def get_grants(self):
+        grants = []
+        for pattern in ('grant_*', 'policy_*'):
+            for grant_key in self.redis.keys(pattern):
+                grant_data = self.redis.get(grant_key)
+                if isinstance(grant_data, bytes):
+                    grant_data = grant_data.decode('utf-8')
+                grants.append(json.loads(grant_data))
+        return grants
+
+    def get_project_sets(self):
+        project_sets = {}
+        for project_set_key in self.redis.keys('project_set_*'):
+            project_set_data = self.redis.get(project_set_key)
+            if isinstance(project_set_data, bytes):
+                project_set_data = project_set_data.decode('utf-8')
+            project_set = json.loads(project_set_data)
+            project_sets[project_set['name']] = project_set
+        return project_sets
+
+    def get_announcements(self):
+        return list_announcements(self.redis, active_only=True)
+
+    def put_projects_list(self):
+        self.redis.set('projects_list', ' '.join(self.projects))
+
+    def put_hosts_per_project_list(self, key, value):
+        self.redis.set(key, value)
+
+
+class ServerConnection(object):
+    #
+    helper = None
+    #
+    arg_type = None
+    search_results = []
+    project_name = None
+    server_name = None
+    server_id = None
+    #
+    # host config
+    #
+    host = None
+    port = None
+    user = None
+    nosudo = None
+    proxy_id = None
+    #
+    proxy_host = None
+    proxy_port = None
+    proxy_user = None
+    #
+    session_exports = list()
+    ISOLATE_SESSION = os.getenv('ISOLATE_SESSION', None)
+    session_exports.append('ISOLATE_CALLBACK="{}";'.format(ISOLATE_SESSION))
+    ssh_wrapper_cmd = os.getenv('ISOLATE_WRAPPER', 'sudo -u auth /opt/auth/wrappers/ssh.py')
+
+    #
+    def __init__(self, helper=None, unknown_args=None):
+        self.helper = helper
+        self.unknown_args = unknown_args
+        self.ssh_wrapper_argv = shlex.split(os.getenv('ISOLATE_WRAPPER', self.ssh_wrapper_cmd))
+        self.connection_id = str(uuid4())
+
+    #
+    # perform connection structure checks
+    #
+    def _validate(self):
+        if len(self.search_results) > 1:
+            raise Exception('passed more that one host in search_results')
+        elif len(self.search_results) == 0:
+            LOGGER.debug('ServerConnection.resolve: No hosts in search_results passed')
+
+
+    #
+    # resolve host configuratin
+    #
+    def resolve(self):
+        if len(self.search_results) != 1:
+            raise PolicyDenied("an exact inventory host is required")
+        project_config = self._get_project_config()
+        host_config = self._get_host_config()
+        final_config = merge_dicts(project_config, host_config)
+
+        self.host = final_config.get('server_ip', self.host)
+        self.port = final_config.get('server_port', None)
+        self.user = final_config.get('server_user', None)
+        self.nosudo = final_config.get('server_nosudo', None)
+        self.proxy_id = final_config.get('proxy_id', None)
+
+        proxy_config = merge_dicts(self._get_proxy_config())  # drop null/None fields
+        if proxy_config is not None:
+            self.proxy_host = proxy_config.get('server_ip')
+            self.proxy_port = proxy_config.get('server_port', None)
+            self.proxy_user = proxy_config.get('server_user', None)
+
+        self._resolve_v2_policy(final_config)
+
+        # LOGGER.critical(json.dumps(project_config, indent=4))
+        # LOGGER.critical(json.dumps(host_config, indent=4))
+        # LOGGER.critical(json.dumps(proxy_config, indent=4))
+        # LOGGER.debug(json.dumps(final_config, indent=4))
+
+
+    #
+    # project wide ssh_config [low]
+    #
+    def _get_project_config(self):
+        project_config = self.helper.db.get_project_config(self.project_name)
+        if project_config is None:
+            LOGGER.debug('_get_project_config: Not found')
+            return None
+        LOGGER.debug('_get_project_config')
+        LOGGER.debug(json.dumps(project_config, indent=4))
+        return project_config
+
+    #
+    # host ssh_config [high]
+    #
+    def _get_host_config(self):
+        if len(self.search_results) != 1:
+            return
+
+        host_config = self.search_results[0]
+        LOGGER.debug('_get_host_config')
+        LOGGER.debug(json.dumps(host_config, indent=4))
+        return host_config
+
+    #
+    # proxy ssh_config
+    #
+    def _get_proxy_config(self):
+        proxy_config = self.helper.db.get_server_config(self.proxy_id)
+        if proxy_config is None:
+            LOGGER.debug('_get_proxy_config: Not found "{}"'.format(self.proxy_id))
+            return None
+        LOGGER.debug('_get_proxy_config')
+        LOGGER.debug(json.dumps(proxy_config, indent=4))
+        return proxy_config
+
+    def _resolve_v2_policy(self, host_config):
+        config = getattr(self.helper, "config", {})
+        identity = getattr(self.helper, "identity", {})
+        policy_defaults = {}
+        policy_defaults.update(config.get("policy", {}))
+        policy_defaults.update(config.get("ssh", {}))
+        try:
+            decision = resolve_grant(
+                identity,
+                project=self.project_name,
+                host=host_config,
+                grants=self.helper.db.get_grants() if hasattr(self.helper.db, "get_grants") else [],
+                project_sets=self.helper.db.get_project_sets() if hasattr(self.helper.db, "get_project_sets") else {},
+                defaults=policy_defaults,
+            )
+            self.user = decision["remote_user"]
+            sudo_mode = str(decision.get("sudo_mode") or "").lower()
+            if sudo_mode in ("none", "no", "false", "nosudo", "no-sudo"):
+                self.nosudo = True
+            else:
+                self.nosudo = False
+            self.policy_decision = decision
+        except PolicyDenied as exc:
+            self.policy_decision = {"denied": str(exc)}
+            raise
+
+    #
+    # build commands
+    #
+    def build_cmd(self):
+        # Unknown helper arguments must never become wrapper identity/target options.
+        allowed = [arg for arg in self.helper.config.get("ssh", {}).get("allowed_extra_args", []) if arg != "-A"]
+        extras = filter_extra_args(self.unknown_args, allowed + ["--debug"])
+        authorization_file = prepare_authorization_file(self.helper.config) if self.helper.config.get("keycloak", {}).get("token_kind") else prepare_authorization_file()
+        self.ssh_wrapper_argv.extend(['--authorization-file', authorization_file])
+        self.session_exports.append('ISOLATE_AUTHORIZATION_FILE={};'.format(shlex.quote(authorization_file)))
+
+        if self.host:
+            self.ssh_wrapper_argv.append(str(self.host))
+        if self.port:
+            self.ssh_wrapper_argv.extend(['--port', str(self.port)])
+        if self.user:
+            self.ssh_wrapper_argv.extend(['--user', str(self.user)])
+        if self.nosudo:
+            self.ssh_wrapper_argv.append('--nosudo')
+
+        self.ssh_wrapper_argv.extend(['--connection-id', self.connection_id])
+        if self.project_name:
+            self.ssh_wrapper_argv.extend(['--project', str(self.project_name)])
+        if self.server_id:
+            self.ssh_wrapper_argv.extend(['--host-id', str(self.server_id)])
+        server_name = (self.search_results[0] if len(self.search_results) == 1 else {}).get('server_name')
+        if server_name:
+            self.ssh_wrapper_argv.extend(['--server-name', str(server_name)])
+        if self.helper.identity.get('username'):
+            self.ssh_wrapper_argv.extend(['--human-user', str(self.helper.identity.get('username'))])
+        if self.helper.identity.get('keycloak_sub'):
+            self.ssh_wrapper_argv.extend(['--keycloak-sub', str(self.helper.identity.get('keycloak_sub'))])
+        if (self.search_results[0] if self.search_results else {}).get('server_vip'):
+            self.ssh_wrapper_argv.append('--vip')
+
+        if self.proxy_id:
+            self.ssh_wrapper_argv.extend(['--proxy-id', str(self.proxy_id)])
+        if self.proxy_host:
+            self.ssh_wrapper_argv.extend(['--proxy-host', str(self.proxy_host)])
+        if self.proxy_port:
+            self.ssh_wrapper_argv.extend(['--proxy-port', str(self.proxy_port)])
+        if self.proxy_user:
+            self.ssh_wrapper_argv.extend(['--proxy-user', str(self.proxy_user)])
+
+        self.ssh_wrapper_argv.extend(extras)
+
+        callback_argv = ' '.join([shlex.quote(str(arg)) for arg in self.ssh_wrapper_argv])
+        self.session_exports.append('ISOLATE_CALLBACK_CMD=({})'.format(callback_argv))
+
+    def _write_session(self):
+        if self.ISOLATE_SESSION is None:
+            return None
+
+        with open(self.ISOLATE_SESSION, 'w') as sess_f:
+            for line in self.session_exports:
+                    sess_f.write(line + '\n')
+
+    def start(self):
+        self._validate()
+        host_meta = self.search_results[0] if len(self.search_results) == 1 else {}
+        self.helper.print_announcements([host_meta])
+        bypass_groups = set(self.helper.config.get("maintenance", {}).get("bypass_groups") or [])
+        identity_groups = set(self.helper.identity.get("groups") or [])
+        if (
+            self.helper.config.get("maintenance", {}).get("enforce", True)
+            and is_host_in_maintenance(host_meta)
+            and not bypass_groups.intersection(identity_groups)
+        ):
+            reason = host_meta.get("maintenance_reason") or "scheduled maintenance"
+            until = host_meta.get("maintenance_until")
+            self.helper.audit.event(
+                "maintenance_denied", project=host_meta.get("project_name"), host_id=host_meta.get("server_id"),
+                reason=reason, maintenance_until=until,
+            )
+            self.helper.print_p("Connection denied: host is in maintenance mode.", stderr=True)
+            self.helper.print_p("Reason: {}".format(reason), stderr=True)
+            if until:
+                self.helper.print_p("Maintenance until: {}".format(until), stderr=True)
+            sys.exit(2)
+        try:
+            self.resolve()
+        except PolicyDenied as exc:
+            host_meta = self.search_results[0] if len(self.search_results) == 1 else {}
+            self.helper.audit.event(
+                "policy_denied",
+                project=self.project_name,
+                host_id=self.server_id,
+                reason=str(exc),
+                server_vip=bool(host_meta.get('server_vip')),
+                privileged_access_provider=host_meta.get('privileged_access_provider'),
+                privileged_access_url=host_meta.get('privileged_access_url'),
+            )
+            if host_meta.get('server_vip') and (
+                host_meta.get('privileged_access_provider')
+                or host_meta.get('privileged_access_url')
+                or host_meta.get('privileged_access_hint')
+            ):
+                provider = host_meta.get('privileged_access_provider') or 'external bastion'
+                self.helper.print_p(
+                    "Privileged access for this VIP host is handled via {}.".format(provider),
+                    stderr=True,
+                )
+                if host_meta.get('privileged_access_url'):
+                    self.helper.print_p(str(host_meta.get('privileged_access_url')), stderr=True)
+                if host_meta.get('privileged_access_hint'):
+                    self.helper.print_p(str(host_meta.get('privileged_access_hint')), stderr=True)
+            self.helper.print_p(
+                "Request access: isolate access request --project {}{} --reason '<reason>'".format(
+                    self.project_name or "<project>",
+                    " --host {}".format(self.server_id) if self.server_id else "",
+                ),
+                stderr=True,
+            )
+            self.helper.print_p("Policy denied: {}".format(exc), stderr=True)
+            sys.exit(2)
+        try:
+            self.build_cmd()
+        except (SSHArgumentError, IdentityError, OSError) as exc:
+            self.helper.print_p("Connection denied: {}".format(exc), stderr=True)
+            sys.exit(2)
+        self._write_session()
+
+        connection_audit = SessionLogger(
+            self.helper.config["logging"]["base_path"],
+            self.helper.identity,
+            session_id=self.connection_id,
+            logging_config=self.helper.config.get("logging", {}),
+        )
+        connection_audit.event(
+            "policy_selected",
+            project=self.project_name,
+            host_id=self.server_id,
+            server_name=(self.search_results[0] if len(self.search_results) == 1 else {}).get('server_name'),
+            target_host=self.host,
+            remote_user=self.user,
+            connection_id=self.connection_id,
+            server_vip=bool((self.search_results[0] if len(self.search_results) == 1 else {}).get('server_vip')),
+            policy=self.policy_decision,
+        )
+
+        # debug
+        self.__dict__.pop('helper', None)
+        self.__dict__.pop('host_ssh_config', None)
+        self.__dict__.pop('project_config', None)
+        self.__dict__.pop('search_results', None)
+
+        LOGGER.debug(self.__dict__)
+
+
+class AuthHelper(object):
+
+    def __init__(self, args, unknown_args):
+        self.uuid = str(uuid4())
+        self.time_start = time()
+        self.args = args
+        self.unknown_args = unknown_args
+        self.config = load_config()
+        self._init_env_vars()
+        self.identity = self._load_identity()
+        self.audit = SessionLogger(
+            self.config["logging"]["base_path"],
+            self.identity,
+            logging_config=self.config.get("logging", {}),
+        )
+        self.audit.event("helper_start", argv=sys.argv)
+        self.hosts_dump = []
+        self.projects = []
+
+        if self.ISOLATE_BACKEND == 'redis':
+            self.db = IsolateRedisHosts(self.config)
+        elif self.ISOLATE_BACKEND == 'zabbix':
+            self.db = IsolateZabbixHosts()
+        else:
+            LOGGER.critical('Incorrect backend')
+            sys.exit(1)
+
+        self._load_data()
+        LOGGER.debug('AuthHelper init done')
+
+    def _load_identity(self):
+        if self.args.action[0] == 'cron':
+            return local_identity(os.getenv('USER', 'USER_ENV_NOT_SET'), [])
+        try:
+            return load_verified_identity(self.config)
+        except IdentityError as exc:
+            self.print_p("Isolate identity unavailable: {}; run isolate login".format(exc), stderr=True)
+            sys.exit(2)
+
+    @staticmethod
+    def print_p(arg, stderr=False):
+        try:
+            if not stderr:
+                sys.stdout.write(str(arg) + '\n')
+                sys.stdout.flush()
+            else:
+                sys.stderr.write(str(arg) + '\n')
+                sys.stderr.flush()
+        except IOError:
+            try:
+                sys.stdout.close()
+            except IOError:
+                pass
+            try:
+                sys.stderr.close()
+            except IOError:
+                pass
+                exit(0)
+
+    @staticmethod
+    def is_valid_ipv4(address):
+        try:
+            socket.inet_pton(socket.AF_INET, address)
+        except AttributeError:  # no inet_pton here, sorry
+            try:
+                socket.inet_aton(address)
+            except socket.error:
+                return False
+            return True
+        except socket.error:  # not a valid address
+            return False
+
+        return True
+
+    @staticmethod
+    def is_valid_ipv6(address):
+        try:
+            socket.inet_pton(socket.AF_INET6, address)
+        except socket.error:  # not a valid address
+            return False
+        return True
+
+    @staticmethod
+    def is_valid_fqdn(hostname):
+        # FQDN must be pretty, without dots at start/end
+        # and have one minimum
+        hostname = str(hostname).lower()
+        if len(hostname) > 255:
+            return False
+        if hostname[-1] == '.' or hostname[0] == '.' or '.' not in hostname:
+            return False
+        if re.match(r'^([a-z\d\-.]*)$', hostname) is None:
+            return False
+        return True
+
+    def _init_env_vars(self):
+        # Main config options
+        self.ISOLATE_BACKEND = os.getenv('ISOLATE_BACKEND', 'redis')
+        self.ISOLATE_DATA_ROOT = os.getenv('ISOLATE_DATA_ROOT', '/opt/auth')
+        self.ISOLATE_DEBUG = str2bool(os.getenv('ISOLATE_DEBUG', False))
+
+        self.USER = os.getenv('USER', 'USER_ENV_NOT_SET')
+        self.SUDO_USER = os.getenv('SUDO_USER', 'SUDO_USER_ENV_NOT_SET')
+        self.ISOLATE_WRAPPER = os.getenv('ISOLATE_WRAPPER', 'sudo -u auth /mnt/data/auth/wrap/ssh.py')
+
+        # User interface options
+        # search print fields seporator
+        self.ISOLATE_SPF_SEP = os.getenv('ISOLATE_SPF_SEP', ' | ')
+
+        # Go to server immediately if only one server in group
+        self.ISOLATE_BLINDE = str2bool(os.getenv('ISOLATE_BLINDE', True))
+
+        # Colorize interface
+        self.ISOLATE_COLORS = str2bool(os.getenv('ISOLATE_COLORS', False))
+
+        # Search Print Line: fields names and order, not template
+        self.ISOLATE_SPF = os.getenv('ISOLATE_SPF', 'server_id server_ip server_name server_vip_marker maintenance_marker server_services_display').strip().split(' ')
+
+    def _load_data(self):
+        self.hosts_dump = sorted(self.db.get_hosts(), key=itemgetter('project_name', 'server_name'))
+        if self.args.action[0] != 'cron':
+            policy_defaults = {}
+            policy_defaults.update(self.config.get("policy", {}))
+            policy_defaults.update(self.config.get("ssh", {}))
+            self.hosts_dump = filter_allowed_hosts(
+                self.identity,
+                self.hosts_dump,
+                grants=self.db.get_grants() if hasattr(self.db, "get_grants") else [],
+                project_sets=self.db.get_project_sets() if hasattr(self.db, "get_project_sets") else {},
+                defaults=policy_defaults,
+            )
+        self.projects = list(sorted(set([host['project_name'] for host in self.hosts_dump])))
+        self.projects = [x.lower() for x in self.projects]
+        self.projects_configs = self.db
+        LOGGER.debug('_load_data')
+        LOGGER.debug(json.dumps(self.hosts_dump, indent=4))
+        LOGGER.debug(json.dumps(self.projects, indent=4))
+
+    @staticmethod
+    def _search_in_item(**kwargs):
+        item = kwargs.get('item')
+        item_keys = item.keys()
+        # query_src = kwargs.get('query_src')
+        query_lower = kwargs.get('query_lower')
+
+        # project_id - is bad idea
+        fields = kwargs.get('fields', ['project_name',
+                                       'project_id',
+                                       'server_name',
+                                       'server_id',
+                                       'server_ip',
+                                       'server_services',
+                                       'server_services_display',
+                                       'server_note',
+                                       'server_vip_marker',
+                                       'privileged_access_provider',
+                                       'privileged_access_url',
+                                       'privileged_access_hint',
+                                       'os_version',
+                                       'geoip_asn'])  # 'alerts'
+
+        exact_match = kwargs.get('exact_match', False)
+
+        if exact_match:
+            for key in fields:
+                if key not in item_keys:
+                    continue
+                if query_lower == str(item[key]).lower():
+                    item['exact_match'] = key
+                    return item
+        else:
+            for key in fields:
+                if key not in item_keys:
+                    continue
+                if query_lower in str(item[key]).lower():
+                    item['match_by'] = key
+                    return item
+        return False
+
+    def search(self, query, **kwargs):
+        time_search_start = time()
+        source = kwargs.pop('source', self.hosts_dump)
+        project_name = kwargs.pop('project_name', False)
+        kwargs.update(query_src=str(query), query_lower=query.lower())
+
+        result = list()
+
+        for item in source:
+            # project filter
+            if project_name:
+                if item['project_name'] != project_name:
+                    continue
+
+            item_query = copy(kwargs)
+            item_query['item'] = item
+
+            res = self._search_in_item(**item_query)
+            if bool(res):
+                result.append(res)
+
+        kwargs.pop('query_lower')
+        kwargs.update(search_time=float(time() - time_search_start))
+
+        if kwargs.get('sort'):
+            result = sorted(result, key=operator.itemgetter(kwargs.get('sort')))
+
+        LOGGER.debug((query, kwargs))
+
+        return result
+
+    def projects_list(self, **kwargs):
+        time_search_start = time()
+        projects = {}
+        hosts = kwargs.pop('source', self.hosts_dump)
+
+        kwargs.update(search_time=float(time() - time_search_start))
+
+        if kwargs.get('sort'):
+            hosts = sorted(hosts, key=operator.itemgetter(kwargs.get('sort')))
+
+        LOGGER.debug(kwargs)
+
+        for host in hosts:
+            if host['project_name'] in projects:
+                projects[host['project_name']] += 1
+            else:
+                projects[host['project_name']] = 1
+
+        return projects
+
+    def colorize(self, text, color=None):
+        colors = dict(
+            header='\033[95m',
+            okblue='\033[94m',
+            okgreen='\033[92m',
+            warning='\033[93m',
+            fail='\033[91m',
+            reset='\033[0m',
+            bold='\033[1m',
+            underline='\033[4m',
+            # fields colors
+            project_name='\033[38;5;45m',
+            group_name='\033[38;5;45m',
+            blue='\033[38;5;45m',
+            critical='\033[38;5;160m',
+            green='\033[38;5;40m',
+            old='\033[38;5;142m',
+            warn='\033[38;5;142m',
+            status='\033[38;5;40m',
+            os_version='\033[38;5;220m'
+        )
+
+        if not self.ISOLATE_COLORS or not colors.get(color, False):
+            return text
+        else:
+            return '{0}{1}{2}'.format(colors.get(color), text, colors.get('reset'))
+
+    def ljust_algin(self, host):
+        # Minimum field size (add spaces)
+        ljust_size = {
+            'project_name': 8,
+            'server_name': 18,
+            'server_id': 6,
+            'server_ip': 16,
+            'ssh_config_ip': 16
+        }
+
+        host = copy(host)
+        for key in self.ISOLATE_SPF:
+            if key not in host.keys():
+                continue
+            if host[key] in [None, True, False]:
+                continue
+            if len(str(host[key])) > 0 and key in self.ISOLATE_SPF:
+                if key in ljust_size:
+                    host[key] = str(host[key]).ljust(ljust_size[key], ' ')
+                if host[key][-1] != ' ':
+                    host[key] += ' '
+        return host
+
+    def append_virtual_fields(self, host, **kwargs):
+        # Some helpful fields hook
+        ambiguous = kwargs.get('ambiguous', False)
+        host_keys = host.keys()
+
+        if ambiguous:
+            self.ISOLATE_SPF = ['server_id', 'match_info', 'exact_match', 'server_id', 'project_name',
+                             'server_ip', 'server_name']
+
+        # matching debug field
+        if 'match_info' in self.ISOLATE_SPF:
+            match_info = list()
+            if 'match_by' in host_keys:
+                match_info.append('by: {}'.format(host['match_by']))
+            if 'exact_match' in host_keys:
+                match_info.append('exact: {}'.format(host['exact_match']))
+
+            host['match_info'] = self.colorize(', '.join(match_info), color='okgreen')
+
+        host['geoip_asn'] = host.get('geoip_asn', None)
+        host['server_services'] = host.get('server_services') or ''
+        host['server_services_display'] = host.get('server_services_display') or host['server_services']
+        host['server_note'] = host.get('server_note') or ''
+        host['server_vip_marker'] = 'VIP' if host.get('server_vip') else ''
+        host['maintenance_marker'] = 'MAINT' if is_host_in_maintenance(host) else ''
+
+        return host
+
+    def print_announcements(self, hosts=None):
+        if not self.config.get('announcements', {}).get('enabled', True):
+            return
+        if not hasattr(self.db, 'get_announcements'):
+            return
+        hosts = [host for host in (hosts or []) if host]
+        rows = []
+        seen = set()
+        for record in self.db.get_announcements():
+            scoped_project = record.get('project')
+            scoped_host = str(record.get('host') or '')
+            if hosts:
+                if not any(
+                    (not scoped_project or scoped_project == host.get('project_name'))
+                    and (not scoped_host or scoped_host == str(host.get('server_id') or ''))
+                    for host in hosts
+                ):
+                    continue
+            elif scoped_project or scoped_host:
+                continue
+            if record.get('id') in seen:
+                continue
+            seen.add(record.get('id'))
+            rows.append(record)
+        if not rows:
+            return
+        self.print_p('\nAnnouncements:')
+        for record in rows:
+            self.print_p('  [{}] {}'.format(str(record.get('severity') or 'info').upper(), record.get('text')))
+
+    def print_hosts(self, hosts, **kwargs):
+        title = kwargs.get('title', True)  # Print project title by default
+        total = kwargs.get('total', True)
+        current_project = None  # stub
+        counter = 0
+
+        if len(hosts) == 0:
+            ambiguous = True
+        else:
+            ambiguous = kwargs.get('ambiguous', False)  # Hosts list is ambiguous
+
+        if ambiguous:
+            if len(hosts) == 0:
+                self.print_p(self.colorize('\n  No servers found by this query: ', color='warn')
+                             + ' '.join(self.args.sargs))
+            else:
+                self.print_p(self.colorize('\n  Ambiguous, more than one server found '
+                                           'by this query: \n', color='warn'))
+
+        if not title:
+            self.print_p('')
+
+        for host in hosts:
+            # project_name
+            # ------
+            # Title
+            if current_project != host['project_name'] and title and not ambiguous:
+                current_project = host['project_name']
+                title_tpl = '\n{0}\n------'.format(self.colorize(current_project, color='project_name'))
+                self.print_p(title_tpl)
+
+            # Fields print prepare
+            host = self.append_virtual_fields(host, ambiguous=ambiguous)
+            host = self.ljust_algin(host)
+
+            # Concat strings
+            host_line = []
+
+            for field in self.ISOLATE_SPF:
+                if field in host.keys() and host[field] not in [None, '']:
+                    host_line.append(host[field])
+
+            if ambiguous or not title:
+                line = '  ' + self.ISOLATE_SPF_SEP.join(host_line)
+            else:
+                line = self.ISOLATE_SPF_SEP.join(host_line)
+
+            self.print_p(line)
+            counter += 1
+
+        if ambiguous:
+            total_tpl = '\n  Total: {0}\n'.format(counter)
+            self.print_p(total_tpl)
+
+        elif total:
+            total_tpl = '\n------\nTotal: {0}\n'.format(counter)
+            self.print_p(total_tpl)
+        else:
+            self.print_p('')
+
+    def print_projects(self, projects, **kwargs):
+        total = kwargs.get('total', True)
+
+        if len(projects) == 0:
+            self.print_p(self.colorize('\n  No projects found', color='warn'))
+        else:
+            self.print_p('')
+
+        for project in projects:
+            title_tpl = '{0}: {1}'.format(self.colorize(project, color='project_name'), projects[project])
+            self.print_p(title_tpl)
+
+        if total:
+            total_tpl = '\n------\nTotal: {0}\n'.format(len(projects))
+            self.print_p(total_tpl)
+        else:
+            self.print_p('')
+
+    def autocomplete_update(self):
+        self.db.put_projects_list()
+        for project in self.projects:
+            hosts = self.search(project, fields=['project_name'])
+            hosts_names = ' '.join([d['server_name'] for d in hosts if 'server_name' in d]).lower()
+            redis_key = 'complete_hosts_' + project
+            self.db.put_hosts_per_project_list(redis_key, hosts_names)
+
+
+def main():
+    args, unknown_args = init_args()
+    config = load_config()
+    if config.get("api", {}).get("client_url") and args.action[0] != "cron":
+        from isolate_client import ClientError, console
+        try:
+            return console(args, unknown_args, config)
+        except (ClientError, IdentityError, OSError) as exc:
+            print("Isolate: {}".format(exc), file=sys.stderr)
+            return 2
+    helper = AuthHelper(args, unknown_args)
+
+    conn = ServerConnection(helper=helper, unknown_args=unknown_args)
+
+    if args.action[0] == 'search':
+        LOGGER.debug('its global search action')
+        LOGGER.debug(args)
+        LOGGER.debug(unknown_args)
+
+        if len(args.sargs) == 1 and args.sargs[0] in helper.projects:
+            search_results = helper.search(args.sargs[0], fields=['project_name'], exact_match=True)
+        elif len(args.sargs) == 2 and args.sargs[0] in helper.projects:
+            search_results = helper.search(args.sargs[1], project_name=args.sargs[0])
+        else:
+            search_results = helper.search(' '.join(args.sargs))
+
+        helper.print_hosts(search_results)
+        helper.print_announcements(search_results)
+
+    elif args.action[0] == 'go':
+
+        if len(args.sargs) > 2:
+            LOGGER.critical('Unknown sargs, see --help in --helper-debug for details')
+            sys.exit(1)
+
+        #
+        # Only one arg
+        #
+        # if its some ID (only digits) search in server_id fields
+        if len(args.sargs) == 1 and args.sargs[0].isdigit():
+            conn.arg_type = 'server_id_only'
+            conn.search_results = helper.search(args.sargs[0], fields=['server_id'], exact_match=True)
+
+            if len(conn.search_results) == 1:
+                conn.project_name = conn.search_results[0]['project_name']
+                conn.server_id = args.sargs[0]
+                conn.start()
+            else:
+                helper.print_hosts(conn.search_results, ambiguous=True)
+
+        elif len(args.sargs) == 1 and args.sargs[0] in helper.projects:
+            conn.arg_type = 'project_only'
+            conn.project_name = args.sargs[0]
+            conn.search_results = helper.search(args.sargs[0], fields=['project_name'], exact_match=True)
+
+            if len(conn.search_results) == 1 and helper.ISOLATE_BLINDE:
+                conn.server_id = conn.search_results[0]['server_id']
+                conn.start()
+            else:
+                helper.print_hosts(conn.search_results)
+
+        # if arg is ipv4 or fqdn
+        elif len(args.sargs) == 1 and helper.is_valid_ipv4(args.sargs[0]):
+            conn.arg_type = 'ipv4_only'
+            conn.host = args.sargs[0]
+            conn.search_results = helper.search(args.sargs[0], fields=['server_ip'], exact_match=True)
+            if len(conn.search_results) == 1:
+                conn.project_name = conn.search_results[0]['project_name']
+                conn.server_id = conn.search_results[0]['server_id']
+            conn.start()
+
+        elif len(args.sargs) == 1 and helper.is_valid_fqdn(args.sargs[0]):
+            LOGGER.debug('is_valid_fqdn')
+            conn.arg_type = 'fqdn_only'
+            conn.host = args.sargs[0]
+            conn.search_results = helper.search(args.sargs[0], fields=['server_name'], exact_match=True)
+            if len(conn.search_results) == 1:
+                conn.project_name = conn.search_results[0]['project_name']
+                conn.server_id = conn.search_results[0]['server_id']
+            conn.start()
+
+        #
+        # Two arguments
+        #
+        # if first arg is project and second ... shit
+        elif len(args.sargs) == 2 and args.sargs[0] in helper.projects:
+            conn.arg_type = 'project_with_some_shit'
+            conn.project_name = args.sargs[0]
+            conn.search_results = helper.search(args.sargs[1], project_name=conn.project_name,
+                                                fields=['server_name', 'server_id', 'server_ip'],
+                                                exact_match=True)
+
+            if len(conn.search_results) == 1:
+                if args.sargs[1].isdigit():
+                    conn.arg_type = 'project_with_server_id_found'
+                    conn.server_id = conn.search_results[0]['server_id']
+
+                elif helper.is_valid_ipv4(args.sargs[1]):
+                    conn.arg_type = 'project_with_ipv4_found'
+                    conn.server_id = conn.search_results[0]['server_id']
+                    conn.host = conn.search_results[0]['server_ip']
+                elif helper.is_valid_fqdn(args.sargs[1]):
+                    conn.arg_type = 'project_with_fqdn_found'
+                    conn.server_id = conn.search_results[0]['server_id']
+                    conn.host = conn.search_results[0]['server_name']
+                else:
+                    conn.arg_type = 'project_with_server_name_found'
+                    conn.server_id = conn.search_results[0]['server_id']
+                    conn.server_name = conn.search_results[0]['server_name']
+                conn.start()
+
+            elif len(conn.search_results) == 0 and len(args.sargs[1]) >= 2:
+                if helper.is_valid_ipv4(args.sargs[1]):
+                    conn.arg_type = 'project_with_ipv4_host_not_found'
+                    conn.start()
+                elif helper.is_valid_fqdn(args.sargs[1]) and not args.sargs[1].isdigit() and '.' in args.sargs[1]:
+                    conn.arg_type = 'project_with_fqdn_host_not_found'
+                    conn.start()
+                else:
+                    helper.print_hosts(conn.search_results, ambiguous=True)
+            else:
+                helper.print_hosts(conn.search_results, ambiguous=True)
+        else:
+            LOGGER.critical('args not match')
+
+    elif args.action[0] == 'cron':
+        # update autocomplete projects_list
+        LOGGER.debug(helper.projects)
+        helper.autocomplete_update()
+    elif args.action[0] == 'projects':
+        projects = helper.projects_list()
+        helper.print_projects(projects)
+    else:
+        LOGGER.critical('Unknown action: ' + args.action[0])
+
+    done_delta = round(time() - helper.time_start, 3)
+    LOGGER.debug('run time: ' + str(done_delta) + ' sec')
+
+if __name__ == '__main__':
+    sys.exit(main())
