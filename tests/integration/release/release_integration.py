@@ -145,10 +145,15 @@ def rehearse(source, temp, issuer, cert, redis_port):
     secret.chmod(0o600)
     listen_port = port()
     config.write_text(json.dumps({"data_root": str(temp), "redis": {"host": "127.0.0.1", "port": redis_port},
-        "keycloak": {"issuer": issuer, "client_id": "fixture", "ca_file": str(cert)},
+        "keycloak": {"issuer": issuer, "client_id": "fixture", "ca_file": str(cert),
+                     "jwks_cache_path": str(temp / "oidc-jwks.json")},
         "dashboard": {"enabled": True, "secret_key_file": str(secret), "public_url": "https://access.example",
                       "listen_host": "127.0.0.1", "listen_port": listen_port, "workers": 1, "admin_groups": ["fixture"]},
-        "logging": {"base_path": str(logs)},
+        "gateway": {"host_key_file": str(temp / "gateway-host-key")},
+        "recordings": {"signing_key_file": str(temp / "recording-signing-key")},
+        "command_execution": {"signing_key_file": str(temp / "job-signing-key")},
+        "policy_as_code": {"approval_key_file": str(temp / "policy-approval-key")},
+        "logging": {"base_path": str(logs), "integrity": {"key_file": str(temp / "log-integrity-key")}},
     }), encoding="utf-8")
     config.chmod(0o600)
     saved_config = config.read_bytes()

@@ -183,7 +183,12 @@ def run_fixture(stack, scratch):
 if __name__ == "__main__":
     if not any(Path(marker).exists() for marker in ("/.dockerenv", "/run/.containerenv")):
         raise SystemExit("Run this fixture inside its disposable integration container")
-    with tempfile.TemporaryDirectory(prefix="isolate-enrollment-apply-") as directory, ExitStack() as resources:
+    # StrictModes validates ancestors of the absolute AuthorizedKeysFile path.
+    # Keep the fixture under /run, outside the world-writable /tmp directory.
+    with (
+        tempfile.TemporaryDirectory(prefix="isolate-enrollment-apply-", dir="/run") as directory,
+        ExitStack() as resources,
+    ):
         root = Path(directory)
         root.chmod(0o755)
         run_fixture(resources, root)
